@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import argparse
-import base64
-import hashlib
 import os
 import re
 import uuid
-from collections import defaultdict
-from typing import Any, Optional
+import base64
+from typing import Optional, Any
 
 import requests
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from tree_sitter import Language, Parser
-
 import tree_sitter_python as ts_python
 import tree_sitter_java as ts_java
 import tree_sitter_javascript as ts_javascript
@@ -23,21 +21,68 @@ import tree_sitter_typescript as ts_typescript
 
 
 # ============================================================
-# FastAPI
+# ENVIRONMENT
+# ============================================================
+
+load_dotenv()
+
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:3000",
+)
+
+BACKEND_URL = os.getenv(
+    "BACKEND_URL",
+    "http://localhost:8000",
+)
+
+GITHUB_AUTHORIZE_URL = os.getenv(
+    "GITHUB_AUTHORIZE_URL",
+    "https://github.com/login/oauth/authorize",
+)
+
+GITHUB_ACCESS_TOKEN_URL = os.getenv(
+    "GITHUB_ACCESS_TOKEN_URL",
+    "https://github.com/login/oauth/access_token",
+)
+
+GITHUB_API_URL = os.getenv(
+    "GITHUB_API_URL",
+    "https://api.github.com",
+)
+
+MAX_FILE_SIZE = int(
+    os.getenv("MAX_FILE_SIZE", "1000000")
+)
+
+DEFAULT_MAX_FILES = int(
+    os.getenv("DEFAULT_MAX_FILES", "500")
+)
+
+
+if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+    print(
+        "WARNING: GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET "
+        "are not configured."
+    )
+
+
+# ============================================================
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
-    title="CodeAtlas",
-    description="Static code intelligence and master graph generator",
+    title="CodeAtlas API",
     version="1.0.0",
 )
 
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=[FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,7 +90,53 @@ app.add_middleware(
 
 
 # ============================================================
-# Constants
+# IN-MEMORY AUTHENTICATION SESSIONS
+# ============================================================
+#
+# IMPORTANT:
+#
+# This dictionary stores ONLY authentication information.
+#
+# It does NOT store:
+#   - repository graphs
+#   - ASTs
+#   - analysis results
+#   - repository source code
+#
+# The graph is returned directly to the browser.
+#
+# For production with multiple backend instances, replace this
+# with Redis or another shared session store.
+# ============================================================
+
+SESSIONS: dict[str, dict[str, Any]] = {}
+
+
+# ============================================================
+# TREE-SITTER
+# ============================================================
+
+LANGUAGES = {
+    "python": Language(ts_python.language()),
+    "java": Language(ts_java.language()),
+    "javascript": Language(ts_javascript.language()),
+    "typescript": Language(
+        ts_typescript.language_typescript()
+    ),
+    "tsx": Language(
+        ts_typescript.language_tsx()
+    ),
+}
+
+
+def create_parser(language_name: str) -> Parser:
+    parser = Parser()
+    parser.language = LANGUAGES[language_name]
+    return parser
+
+
+# ============================================================
+# FILE FILTERING
 # ============================================================
 
 SUPPORTED_EXTENSIONS = {
@@ -56,6 +147,7 @@ SUPPORTED_EXTENSIONS = {
     ".ts": "typescript",
     ".tsx": "tsx",
 }
+
 
 IGNORED_DIRECTORIES = {
     ".git",
@@ -73,8 +165,6 @@ IGNORED_DIRECTORIES = {
     "target",
     "bin",
     "obj",
-
-    # Python
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
@@ -88,12 +178,8 @@ IGNORED_DIRECTORIES = {
     "ENV",
     "site-packages",
     "htmlcov",
-
-    # Java
     ".gradle",
     ".gradle-cache",
-
-    # JS / TS
     "node_modules",
     ".next",
     ".nuxt",
@@ -106,6 +192,7 @@ IGNORED_DIRECTORIES = {
     ".turbo",
     "storybook-static",
 }
+
 
 IGNORED_SUFFIXES = {
     ".pyc",
@@ -132,8 +219,8 @@ IGNORED_SUFFIXES = {
     ".zip",
     ".tar",
     ".gz",
-    ".7z",
     ".rar",
+    ".7z",
     ".mp3",
     ".mp4",
     ".wav",
@@ -143,47 +230,54 @@ IGNORED_SUFFIXES = {
     ".otf",
 }
 
-MAX_FILE_SIZE = 1_000_000
+
+def normalize_path(path: str) -> str:
+    return path.replace("\\", "/")
+
+
+def extension(path: str) -> str:
+    path = path.lower()
+
+    if path.endswith(".min.js"):
+        return ".min.js"
+
+    index = path.rfind(".")
+
+    if index == -1:
+        return ""
+
+    return path[index:]
+
+
+def language_for_path(path: str) -> Optional[str]:
+    ext = extension(path)
+
+    return SUPPORTED_EXTENSIONS.get(ext)
+
+
+def should_ignore(path: str) -> bool:
+    normalized = normalize_path(path)
+
+    parts = normalized.split("/")
+
+    for part in parts[:-1]:
+        if part in IGNORED_DIRECTORIES:
+            return True
+
+    filename = parts[-1].lower()
+
+    if filename.endswith(".min.js"):
+        return True
+
+    for suffix in IGNORED_SUFFIXES:
+        if filename.endswith(suffix):
+            return True
+
+    return False
 
 
 # ============================================================
-# In-memory analysis storage
-# ============================================================
-
-ANALYSES: dict[str, dict[str, Any]] = {}
-
-
-# ============================================================
-# Pydantic models
-# ============================================================
-
-class AnalyzeRequest(BaseModel):
-    repo_url: str
-    max_files: int = 500
-    github_token: Optional[str] = None
-
-
-# ============================================================
-# Tree-sitter setup
-# ============================================================
-
-LANGUAGES = {
-    "python": Language(ts_python.language()),
-    "java": Language(ts_java.language()),
-    "javascript": Language(ts_javascript.language()),
-    "typescript": Language(ts_typescript.language_typescript()),
-    "tsx": Language(ts_typescript.language_tsx()),
-}
-
-
-def create_parser(language_name: str) -> Parser:
-    parser = Parser()
-    parser.language = LANGUAGES[language_name]
-    return parser
-
-
-# ============================================================
-# Utility functions
+# TREE-SITTER HELPERS
 # ============================================================
 
 def node_text(node, source: bytes) -> str:
@@ -198,139 +292,21 @@ def line_number(node) -> int:
 
 
 def make_id(*parts: str) -> str:
-    return "::".join(parts)
-
-
-def normalize_path(path: str) -> str:
-    return path.replace("\\", "/").strip("/")
-
-
-def should_ignore(path: str) -> bool:
-    parts = normalize_path(path).split("/")
-
-    for part in parts[:-1]:
-        if part in IGNORED_DIRECTORIES:
-            return True
-
-    filename = parts[-1]
-
-    for suffix in IGNORED_SUFFIXES:
-        if filename.endswith(suffix):
-            return True
-
-    if filename.endswith(".min.js"):
-        return True
-
-    return False
-
-
-def extension(path: str) -> str:
-    return os.path.splitext(path)[1].lower()
-
-
-def language_for_path(path: str) -> Optional[str]:
-    return SUPPORTED_EXTENSIONS.get(extension(path))
-
-
-def safe_decode_blob(data: dict) -> str:
-    content = data.get("content", "")
-    encoding = data.get("encoding")
-
-    if encoding == "base64":
-        raw = base64.b64decode(content)
-        return raw.decode("utf-8", errors="replace")
-
-    return content
-
-
-# ============================================================
-# GitHub client
-# ============================================================
-
-class GitHubClient:
-
-    def __init__(self, token: Optional[str] = None):
-        self.session = requests.Session()
-
-        self.session.headers.update({
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "CodeAtlas/1.0",
-        })
-
-        if token:
-            self.session.headers["Authorization"] = f"Bearer {token}"
-
-    def request(self, url: str, params=None) -> dict:
-        response = self.session.get(
-            url,
-            params=params,
-            timeout=30,
-        )
-
-        if not response.ok:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = response.text
-
-            raise RuntimeError(
-                f"GitHub API error {response.status_code}: {detail}"
-            )
-
-        return response.json()
-
-    def get_repository(self, owner: str, repo: str):
-        return self.request(
-            f"https://api.github.com/repos/{owner}/{repo}"
-        )
-
-    def get_tree(self, owner: str, repo: str, sha: str):
-        return self.request(
-            f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}",
-            params={"recursive": "1"},
-        )
-
-    def get_blob(self, owner: str, repo: str, sha: str):
-        return self.request(
-            f"https://api.github.com/repos/{owner}/{repo}/git/blobs/{sha}"
-        )
-
-
-# ============================================================
-# GitHub URL parsing
-# ============================================================
-
-def parse_github_url(repo_url: str):
-    repo_url = repo_url.strip().rstrip("/")
-
-    if repo_url.endswith(".git"):
-        repo_url = repo_url[:-4]
-
-    match = re.match(
-        r"https?://github\.com/([^/]+)/([^/]+)$",
-        repo_url,
+    return "::".join(
+        part.replace("\\", "/")
+        for part in parts
+        if part
     )
 
-    if not match:
-        raise ValueError(
-            "Expected a GitHub repository URL such as "
-            "https://github.com/owner/repository"
-        )
-
-    return match.group(1), match.group(2)
-
 
 # ============================================================
-# Graph
+# GRAPH
 # ============================================================
 
 class Graph:
-
     def __init__(self):
         self.nodes: dict[str, dict[str, Any]] = {}
-        self.edges: list[dict[str, Any]] = []
-
-        self.edge_keys = set()
+        self.edges: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     def add_node(
         self,
@@ -339,7 +315,7 @@ class Graph:
         name: str,
         file: Optional[str] = None,
         line: Optional[int] = None,
-        language: Optional[str] = None,
+        **extra,
     ):
         if node_id not in self.nodes:
             self.nodes[node_id] = {
@@ -348,7 +324,7 @@ class Graph:
                 "name": name,
                 "file": file,
                 "line": line,
-                "language": language,
+                **extra,
             }
 
     def add_edge(
@@ -358,1521 +334,1552 @@ class Graph:
         edge_type: str,
         line: Optional[int] = None,
     ):
-        if source == target:
+        if not source or not target:
             return
 
-        key = (source, target, edge_type)
+        key = (
+            source,
+            target,
+            edge_type,
+        )
 
-        if key in self.edge_keys:
-            return
+        if key not in self.edges:
+            self.edges[key] = {
+                "source": source,
+                "target": target,
+                "type": edge_type,
+                "line": line,
+            }
 
-        self.edge_keys.add(key)
-
-        self.edges.append({
-            "source": source,
-            "target": target,
-            "type": edge_type,
-            "line": line,
-        })
-
-    def adjacency(self):
-        result = defaultdict(lambda: defaultdict(list))
-
-        for edge in self.edges:
-            result[edge["source"]][edge["type"]].append(
-                edge["target"]
-            )
-
+    def json(self):
         return {
-            source: dict(edge_types)
-            for source, edge_types in result.items()
+            "nodes": list(self.nodes.values()),
+            "edges": list(self.edges.values()),
         }
 
 
 # ============================================================
-# Repository Analyzer
+# GITHUB CLIENT
 # ============================================================
 
-class RepositoryAnalyzer:
+class GitHubClient:
+    def __init__(self, token: str):
+        self.token = token
 
-    def __init__(
+        self.session = requests.Session()
+
+        self.session.headers.update({
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "CodeAtlas/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs,
+    ):
+        response = self.session.request(
+            method,
+            url,
+            timeout=30,
+            **kwargs,
+        )
+
+        if response.status_code >= 400:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text
+
+            raise HTTPException(
+                status_code=response.status_code,
+                detail={
+                    "github_error": detail,
+                },
+            )
+
+        return response
+
+    def get_repository(
         self,
         owner: str,
         repo: str,
-        token: Optional[str] = None,
-        max_files: int = 500,
     ):
-        self.owner = owner
-        self.repo = repo
-        self.max_files = max_files
-
-        self.github = GitHubClient(token)
-
-        self.graph = Graph()
-
-        self.files: dict[str, dict[str, Any]] = {}
-
-        # Symbol indexes
-        self.symbols_by_name = defaultdict(list)
-        self.symbols_by_file = defaultdict(list)
-
-        # Import relationships
-        self.imports_by_file = defaultdict(list)
-
-        # Used later for dependency inference
-        self.file_relationships = defaultdict(set)
-
-    # --------------------------------------------------------
-    # Main
-    # --------------------------------------------------------
-
-    def analyze(self):
-
-        metadata = self.github.get_repository(
-            self.owner,
-            self.repo,
+        response = self.request(
+            "GET",
+            f"{GITHUB_API_URL}/repos/{owner}/{repo}",
         )
 
-        default_branch = metadata["default_branch"]
+        return response.json()
 
-        branch_data = self.github.request(
-            f"https://api.github.com/repos/"
-            f"{self.owner}/{self.repo}/branches/{default_branch}"
-        )
-
-        tree_sha = branch_data["commit"]["sha"]
-
-        tree = self.github.get_tree(
-            self.owner,
-            self.repo,
-            tree_sha,
-        )
-
-        entries = tree.get("tree", [])
-
-        source_entries = []
-
-        for entry in entries:
-
-            if entry.get("type") != "blob":
-                continue
-
-            path = normalize_path(entry.get("path", ""))
-
-            if should_ignore(path):
-                continue
-
-            lang = language_for_path(path)
-
-            if not lang:
-                continue
-
-            size = entry.get("size", 0)
-
-            if size and size > MAX_FILE_SIZE:
-                continue
-
-            source_entries.append({
-                "path": path,
-                "sha": entry.get("sha"),
-                "size": size,
-                "language": lang,
-            })
-
-        source_entries = source_entries[:self.max_files]
-
-        # Build repository hierarchy
-        self.build_file_nodes(
-            source_entries,
-            metadata,
-        )
-
-        # Fetch and parse
-        for entry in source_entries:
-            self.process_file(entry)
-
-        # Cross-file dependency edges
-        self.build_dependency_edges()
-
-        return {
-            "repository": {
-                "owner": self.owner,
-                "name": self.repo,
-                "full_name": metadata.get("full_name"),
-                "default_branch": default_branch,
-                "stars": metadata.get("stargazers_count", 0),
-                "language": metadata.get("language"),
+    def get_tree(
+        self,
+        owner: str,
+        repo: str,
+        tree_sha: str,
+    ):
+        response = self.request(
+            "GET",
+            f"{GITHUB_API_URL}/repos/{owner}/{repo}/git/trees/{tree_sha}",
+            params={
+                "recursive": "1",
             },
-            "nodes": list(self.graph.nodes.values()),
-            "edges": self.graph.edges,
-            "adjacency": self.graph.adjacency(),
-            "stats": self.get_stats(),
-            "tree_truncated": tree.get("truncated", False),
-        }
+        )
 
-    # --------------------------------------------------------
-    # Repository hierarchy
-    # --------------------------------------------------------
+        return response.json()
 
-    def build_file_nodes(
+    def get_blob(
         self,
-        entries: list[dict],
-        metadata: dict,
+        owner: str,
+        repo: str,
+        sha: str,
     ):
-
-        repository_id = "repository"
-
-        self.graph.add_node(
-            repository_id,
-            "repository",
-            metadata.get("name", self.repo),
+        response = self.request(
+            "GET",
+            f"{GITHUB_API_URL}/repos/{owner}/{repo}/git/blobs/{sha}",
         )
 
-        directories = set()
+        return response.json()
 
-        for entry in entries:
 
-            path = entry["path"]
+# ============================================================
+# GITHUB URL
+# ============================================================
 
-            parts = path.split("/")
+def parse_github_url(repo_url: str):
+    repo_url = repo_url.strip()
 
-            current_parent = repository_id
+    pattern = (
+        r"^https?://github\.com/"
+        r"([^/]+)/([^/#?]+)"
+        r"/?$"
+    )
 
-            for index in range(len(parts) - 1):
+    match = re.match(pattern, repo_url)
 
-                directory = parts[index]
-
-                directory_path = "/".join(parts[:index + 1])
-
-                directory_id = f"directory::{directory_path}"
-
-                if directory_id not in directories:
-
-                    self.graph.add_node(
-                        directory_id,
-                        "directory",
-                        directory,
-                    )
-
-                    directories.add(directory_id)
-
-                    self.graph.add_edge(
-                        current_parent,
-                        directory_id,
-                        "contains",
-                    )
-
-                current_parent = directory_id
-
-            file_id = f"file::{path}"
-
-            self.graph.add_node(
-                file_id,
-                "file",
-                os.path.basename(path),
-                file=path,
-                language=entry["language"],
-            )
-
-            self.graph.add_edge(
-                current_parent,
-                file_id,
-                "contains",
-            )
-
-            self.files[path] = {
-                **entry,
-                "node_id": file_id,
-            }
-
-    # --------------------------------------------------------
-    # File processing
-    # --------------------------------------------------------
-
-    def process_file(self, entry):
-
-        path = entry["path"]
-        sha = entry["sha"]
-
-        try:
-            blob = self.github.get_blob(
-                self.owner,
-                self.repo,
-                sha,
-            )
-
-            source = safe_decode_blob(blob)
-
-        except Exception as exc:
-            print(f"Failed to fetch {path}: {exc}")
-            return
-
-        self.files[path]["source"] = source
-
-        language = entry["language"]
-
-        parser = create_parser(language)
-
-        tree = parser.parse(
-            source.encode("utf-8")
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid GitHub repository URL.",
         )
 
-        root = tree.root_node
+    owner = match.group(1)
+    repo = match.group(2)
 
-        if root.has_error:
-            # We still process the tree because Tree-sitter
-            # can provide useful partial syntax trees.
-            pass
+    if repo.endswith(".git"):
+        repo = repo[:-4]
 
-        self.extract_file(
-            path,
-            language,
-            source.encode("utf-8"),
-            root,
+    return owner, repo
+
+
+# ============================================================
+# SOURCE DECODING
+# ============================================================
+
+def safe_decode_blob(blob: dict) -> str:
+    if blob.get("encoding") != "base64":
+        return ""
+
+    try:
+        raw = base64.b64decode(
+            blob.get("content", "")
         )
 
-    # --------------------------------------------------------
-    # Generic traversal
-    # --------------------------------------------------------
+        if len(raw) > MAX_FILE_SIZE:
+            return ""
 
-    def walk(self, node):
-
-        yield node
-
-        for child in node.children:
-            yield from self.walk(child)
-
-    # --------------------------------------------------------
-    # Add declaration
-    # --------------------------------------------------------
-
-    def register_symbol(
-        self,
-        path: str,
-        name: str,
-        node_type: str,
-        node,
-        parent_id: Optional[str] = None,
-    ) -> str:
-
-        file_id = self.files[path]["node_id"]
-
-        if parent_id:
-            symbol_id = make_id(
-                path,
-                parent_id.split("::")[-1],
-                name,
-            )
-        else:
-            symbol_id = make_id(path, name)
-
-        # Make collision-safe
-        original_id = symbol_id
-        counter = 2
-
-        while symbol_id in self.graph.nodes:
-
-            existing = self.graph.nodes[symbol_id]
-
-            if (
-                existing.get("file") == path
-                and existing.get("name") == name
-            ):
-                break
-
-            symbol_id = f"{original_id}#{counter}"
-            counter += 1
-
-        self.graph.add_node(
-            symbol_id,
-            node_type,
-            name,
-            file=path,
-            line=line_number(node),
-            language=self.files[path]["language"],
+        return raw.decode(
+            "utf-8",
+            errors="replace",
         )
 
-        self.graph.add_edge(
-            parent_id or file_id,
-            symbol_id,
-            "contains",
-            line_number(node),
-        )
+    except Exception:
+        return ""
 
-        self.symbols_by_name[name].append(symbol_id)
-        self.symbols_by_file[path].append(symbol_id)
 
-        return symbol_id
+# ============================================================
+# SYMBOL EXTRACTION
+# ============================================================
 
-    # ========================================================
-    # Language extraction
-    # ========================================================
+def extract_python(
+    root,
+    source: bytes,
+    file_path: str,
+    graph: Graph,
+):
+    symbols = []
 
-    def extract_file(
-        self,
-        path: str,
-        language: str,
-        source: bytes,
-        root,
-    ):
+    cursor = root.walk()
 
-        if language == "python":
-            self.extract_python(path, source, root)
+    def visit(node):
+        node_type = node.type
 
-        elif language == "java":
-            self.extract_java(path, source, root)
+        if node_type in (
+            "function_definition",
+            "async_function_definition",
+        ):
+            name_node = node.child_by_field_name("name")
 
-        elif language in {
-            "javascript",
-            "typescript",
-            "tsx",
-        }:
-            self.extract_javascript(
-                path,
-                source,
-                root,
-            )
-
-    # ========================================================
-    # Python
-    # ========================================================
-
-    def extract_python(
-        self,
-        path,
-        source,
-        root,
-    ):
-
-        symbol_stack = []
-
-        for node in self.walk(root):
-
-            if node.type in {
-                "function_definition",
-                "async_function_definition",
-            }:
-
-                name_node = node.child_by_field_name("name")
-
-                if not name_node:
-                    continue
-
+            if name_node:
                 name = node_text(
                     name_node,
                     source,
                 )
 
-                parent_id = (
-                    symbol_stack[-1]
-                    if symbol_stack
-                    else None
+                node_id = make_id(
+                    file_path,
+                    name,
                 )
 
-                symbol_id = self.register_symbol(
-                    path,
-                    name,
+                graph.add_node(
+                    node_id,
                     "function",
-                    node,
-                    parent_id,
-                )
-
-                self.extract_python_calls(
-                    path,
-                    node,
-                    source,
-                    symbol_id,
-                )
-
-                self.extract_python_imports(
-                    path,
-                    node,
-                    source,
-                )
-
-            elif node.type == "class_definition":
-
-                name_node = node.child_by_field_name("name")
-
-                if not name_node:
-                    continue
-
-                name = node_text(
-                    name_node,
-                    source,
-                )
-
-                class_id = self.register_symbol(
-                    path,
                     name,
-                    "class",
-                    node,
-                )
-
-                # Base classes
-                bases = node.child_by_field_name("superclasses")
-
-                if bases:
-
-                    for base in self.walk(bases):
-
-                        if base.type in {
-                            "identifier",
-                            "attribute",
-                        }:
-
-                            base_name = node_text(
-                                base,
-                                source,
-                            )
-
-                            target = self.resolve_symbol(
-                                base_name,
-                                path,
-                            )
-
-                            if target:
-                                self.graph.add_edge(
-                                    class_id,
-                                    target,
-                                    "inherits",
-                                    line_number(node),
-                                )
-
-        # Imports are easier to extract globally.
-        self.extract_python_imports(
-            path,
-            root,
-            source,
-        )
-
-        self.extract_generic_calls(
-            path,
-            root,
-            source,
-            language="python",
-        )
-
-    def extract_python_imports(
-        self,
-        path,
-        node,
-        source,
-    ):
-
-        for current in self.walk(node):
-
-            if current.type == "import_statement":
-
-                text = node_text(
-                    current,
-                    source,
-                )
-
-                # import foo
-                # import foo.bar
-                names = text.replace(
-                    "import ",
-                    "",
-                    1,
-                ).split(",")
-
-                for item in names:
-
-                    item = item.strip()
-
-                    if " as " in item:
-                        item = item.split(" as ")[0]
-
-                    module_name = item.strip()
-
-                    if module_name:
-                        self.imports_by_file[path].append(
-                            module_name
-                        )
-
-                        self.add_import_edge(
-                            path,
-                            module_name,
-                            line_number(current),
-                        )
-
-            elif current.type == "import_from_statement":
-
-                text = node_text(
-                    current,
-                    source,
-                )
-
-                match = re.match(
-                    r"from\s+([^\s]+)\s+import\s+(.+)",
-                    text,
-                    re.DOTALL,
-                )
-
-                if not match:
-                    continue
-
-                module = match.group(1)
-
-                self.imports_by_file[path].append(
-                    module
-                )
-
-                self.add_import_edge(
-                    path,
-                    module,
-                    line_number(current),
-                )
-
-    # ========================================================
-    # Java
-    # ========================================================
-
-    def extract_java(
-        self,
-        path,
-        source,
-        root,
-    ):
-
-        class_stack = []
-
-        for node in self.walk(root):
-
-            if node.type in {
-                "class_declaration",
-                "interface_declaration",
-                "enum_declaration",
-            }:
-
-                name_node = node.child_by_field_name("name")
-
-                if not name_node:
-                    continue
-
-                name = node_text(
-                    name_node,
-                    source,
-                )
-
-                if node.type == "interface_declaration":
-                    node_type = "interface"
-                else:
-                    node_type = "class"
-
-                class_id = self.register_symbol(
-                    path,
-                    name,
-                    node_type,
-                    node,
-                )
-
-                # extends / implements
-                declaration = node_text(
-                    node,
-                    source,
-                )
-
-                extends_match = re.search(
-                    r"\bextends\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)",
-                    declaration,
-                )
-
-                if extends_match:
-
-                    base = extends_match.group(1)
-
-                    target = self.resolve_symbol(
-                        base.split(".")[-1],
-                        path,
-                    )
-
-                    if target:
-                        self.graph.add_edge(
-                            class_id,
-                            target,
-                            "inherits",
-                            line_number(node),
-                        )
-
-                implements_match = re.search(
-                    r"\bimplements\s+([^{]+)",
-                    declaration,
-                )
-
-                if implements_match:
-
-                    interfaces = implements_match.group(1)
-
-                    for interface in interfaces.split(","):
-
-                        interface = interface.strip()
-
-                        interface = re.split(
-                            r"[\s<]",
-                            interface,
-                        )[0]
-
-                        target = self.resolve_symbol(
-                            interface,
-                            path,
-                        )
-
-                        if target:
-                            self.graph.add_edge(
-                                class_id,
-                                target,
-                                "implements",
-                                line_number(node),
-                            )
-
-                # Methods
-                for child in node.children:
-
-                    if child.type in {
-                        "method_declaration",
-                        "constructor_declaration",
-                    }:
-
-                        method_name_node = (
-                            child.child_by_field_name("name")
-                        )
-
-                        if not method_name_node:
-                            continue
-
-                        method_name = node_text(
-                            method_name_node,
-                            source,
-                        )
-
-                        method_id = self.register_symbol(
-                            path,
-                            method_name,
-                            "method",
-                            child,
-                            class_id,
-                        )
-
-                        self.extract_generic_calls(
-                            path,
-                            child,
-                            source,
-                            language="java",
-                            current_symbol=method_id,
-                        )
-
-        # Imports
-        for node in self.walk(root):
-
-            if node.type == "import_declaration":
-
-                text = node_text(
-                    node,
-                    source,
-                )
-
-                text = text.replace(
-                    "import",
-                    "",
-                    1,
-                ).strip()
-
-                text = text.rstrip(";").strip()
-
-                if text.startswith("static "):
-                    text = text[len("static "):].strip()
-
-                self.imports_by_file[path].append(
-                    text
-                )
-
-                self.add_import_edge(
-                    path,
-                    text,
+                    file_path,
                     line_number(node),
                 )
 
-    # ========================================================
-    # JavaScript / TypeScript
-    # ========================================================
+                symbols.append({
+                    "id": node_id,
+                    "name": name,
+                    "type": "function",
+                    "line": line_number(node),
+                })
 
-    def extract_javascript(
-        self,
-        path,
-        source,
-        root,
-    ):
+        elif node_type == "class_definition":
+            name_node = node.child_by_field_name("name")
 
-        for node in self.walk(root):
-
-            if node.type in {
-                "function_declaration",
-            }:
-
-                name_node = node.child_by_field_name("name")
-
-                if not name_node:
-                    continue
-
+            if name_node:
                 name = node_text(
                     name_node,
                     source,
                 )
 
-                symbol_id = self.register_symbol(
-                    path,
+                node_id = make_id(
+                    file_path,
                     name,
-                    "function",
-                    node,
                 )
 
-                self.extract_generic_calls(
-                    path,
-                    node,
-                    source,
-                    language="javascript",
-                    current_symbol=symbol_id,
-                )
-
-            elif node.type == "class_declaration":
-
-                name_node = node.child_by_field_name("name")
-
-                if not name_node:
-                    continue
-
-                name = node_text(
-                    name_node,
-                    source,
-                )
-
-                class_id = self.register_symbol(
-                    path,
-                    name,
+                graph.add_node(
+                    node_id,
                     "class",
-                    node,
+                    name,
+                    file_path,
+                    line_number(node),
                 )
 
-                declaration = node_text(
-                    node,
-                    source,
-                )
+                symbols.append({
+                    "id": node_id,
+                    "name": name,
+                    "type": "class",
+                    "line": line_number(node),
+                })
 
-                extends_match = re.search(
-                    r"\bextends\s+([A-Za-z_$][\w$]*)",
-                    declaration,
-                )
+        for child in node.children:
+            visit(child)
 
-                if extends_match:
+    visit(root)
 
-                    base = extends_match.group(1)
-
-                    target = self.resolve_symbol(
-                        base,
-                        path,
-                    )
-
-                    if target:
-                        self.graph.add_edge(
-                            class_id,
-                            target,
-                            "inherits",
-                            line_number(node),
-                        )
-
-                # Class methods
-                for child in self.walk(node):
-
-                    if child.type in {
-                        "method_definition",
-                        "public_field_definition",
-                        "field_definition",
-                    }:
-
-                        name_node = (
-                            child.child_by_field_name("name")
-                        )
-
-                        if not name_node:
-                            continue
-
-                        method_name = node_text(
-                            name_node,
-                            source,
-                        )
-
-                        method_id = self.register_symbol(
-                            path,
-                            method_name,
-                            "method",
-                            child,
-                            class_id,
-                        )
-
-                        self.extract_generic_calls(
-                            path,
-                            child,
-                            source,
-                            language="javascript",
-                            current_symbol=method_id,
-                        )
-
-            elif node.type in {
-                "lexical_declaration",
-                "variable_declaration",
-            }:
-
-                self.extract_arrow_functions(
-                    path,
-                    node,
-                    source,
-                )
-
-        self.extract_js_imports(
-            path,
-            root,
-            source,
-        )
-
-        self.extract_generic_calls(
-            path,
-            root,
-            source,
-            language="javascript",
-        )
-
-    def extract_arrow_functions(
-        self,
-        path,
-        node,
-        source,
-    ):
-
-        for child in self.walk(node):
-
-            if child.type not in {
-                "arrow_function",
-                "function",
-            }:
-                continue
-
-            parent = child.parent
-
-            if not parent:
-                continue
-
-            # Look for:
-            #
-            # const foo = () => {}
-            #
-            # const foo = function() {}
-
-            declaration = parent.parent
-
-            if not declaration:
-                continue
-
+    # Imports
+    for node in walk_tree(root):
+        if node.type == "import_statement":
             text = node_text(
-                declaration,
+                node,
                 source,
             )
 
-            match = re.search(
-                r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
+            modules = re.findall(
+                r"import\s+([a-zA-Z_][\w.]*)",
                 text,
             )
 
-            if not match:
-                continue
+            for module in modules:
+                symbols.append({
+                    "import": module,
+                    "line": line_number(node),
+                })
 
-            name = match.group(1)
-
-            symbol_id = self.register_symbol(
-                path,
-                name,
-                "function",
-                child,
-            )
-
-            self.extract_generic_calls(
-                path,
-                child,
-                source,
-                language="javascript",
-                current_symbol=symbol_id,
-            )
-
-    def extract_js_imports(
-        self,
-        path,
-        root,
-        source,
-    ):
-
-        for node in self.walk(root):
-
-            if node.type not in {
-                "import_statement",
-            }:
-                continue
-
+        elif node.type == "import_from_statement":
             text = node_text(
                 node,
                 source,
             )
 
             match = re.search(
-                r"""from\s+["']([^"']+)["']""",
+                r"from\s+([a-zA-Z_][\w.]*)",
+                text,
+            )
+
+            if match:
+                symbols.append({
+                    "import": match.group(1),
+                    "line": line_number(node),
+                })
+
+    return symbols
+
+
+def extract_java(
+    root,
+    source: bytes,
+    file_path: str,
+    graph: Graph,
+):
+    symbols = []
+
+    for node in walk_tree(root):
+
+        if node.type in (
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+        ):
+            name_node = node.child_by_field_name("name")
+
+            if name_node:
+                name = node_text(
+                    name_node,
+                    source,
+                )
+
+                node_type = {
+                    "class_declaration": "class",
+                    "interface_declaration": "interface",
+                    "enum_declaration": "class",
+                }[node.type]
+
+                node_id = make_id(
+                    file_path,
+                    name,
+                )
+
+                graph.add_node(
+                    node_id,
+                    node_type,
+                    name,
+                    file_path,
+                    line_number(node),
+                )
+
+                symbols.append({
+                    "id": node_id,
+                    "name": name,
+                    "type": node_type,
+                    "line": line_number(node),
+                })
+
+        elif node.type in (
+            "method_declaration",
+            "constructor_declaration",
+        ):
+            name_node = node.child_by_field_name("name")
+
+            if name_node:
+                name = node_text(
+                    name_node,
+                    source,
+                )
+
+                node_id = make_id(
+                    file_path,
+                    name,
+                )
+
+                graph.add_node(
+                    node_id,
+                    "method",
+                    name,
+                    file_path,
+                    line_number(node),
+                )
+
+                symbols.append({
+                    "id": node_id,
+                    "name": name,
+                    "type": "method",
+                    "line": line_number(node),
+                })
+
+        elif node.type == "import_declaration":
+            text = node_text(
+                node,
+                source,
+            )
+
+            text = re.sub(
+                r"^\s*import\s+",
+                "",
+                text,
+            )
+
+            text = text.rstrip(";").strip()
+
+            symbols.append({
+                "import": text,
+                "line": line_number(node),
+            })
+
+    return symbols
+
+
+def extract_javascript(
+    root,
+    source: bytes,
+    file_path: str,
+    graph: Graph,
+):
+    symbols = []
+
+    for node in walk_tree(root):
+
+        if node.type in (
+            "function_declaration",
+            "generator_function_declaration",
+        ):
+            name_node = node.child_by_field_name("name")
+
+            if name_node:
+                name = node_text(
+                    name_node,
+                    source,
+                )
+
+                node_id = make_id(
+                    file_path,
+                    name,
+                )
+
+                graph.add_node(
+                    node_id,
+                    "function",
+                    name,
+                    file_path,
+                    line_number(node),
+                )
+
+                symbols.append({
+                    "id": node_id,
+                    "name": name,
+                    "type": "function",
+                    "line": line_number(node),
+                })
+
+        elif node.type == "class_declaration":
+            name_node = node.child_by_field_name("name")
+
+            if name_node:
+                name = node_text(
+                    name_node,
+                    source,
+                )
+
+                node_id = make_id(
+                    file_path,
+                    name,
+                )
+
+                graph.add_node(
+                    node_id,
+                    "class",
+                    name,
+                    file_path,
+                    line_number(node),
+                )
+
+                symbols.append({
+                    "id": node_id,
+                    "name": name,
+                    "type": "class",
+                    "line": line_number(node),
+                })
+
+        elif node.type in (
+            "method_definition",
+        ):
+            name_node = node.child_by_field_name("name")
+
+            if name_node:
+                name = node_text(
+                    name_node,
+                    source,
+                )
+
+                node_id = make_id(
+                    file_path,
+                    name,
+                )
+
+                graph.add_node(
+                    node_id,
+                    "method",
+                    name,
+                    file_path,
+                    line_number(node),
+                )
+
+                symbols.append({
+                    "id": node_id,
+                    "name": name,
+                    "type": "method",
+                    "line": line_number(node),
+                })
+
+        elif node.type in (
+            "import_statement",
+            "import_clause",
+        ):
+            text = node_text(
+                node,
+                source,
+            )
+
+            match = re.search(
+                r"from\s+['\"]([^'\"]+)['\"]",
                 text,
             )
 
             if not match:
                 match = re.search(
-                    r"""import\s+["']([^"']+)["']""",
+                    r"import\s+['\"]([^'\"]+)['\"]",
                     text,
                 )
 
-            if not match:
-                continue
+            if match:
+                symbols.append({
+                    "import": match.group(1),
+                    "line": line_number(node),
+                })
 
-            module = match.group(1)
+    return symbols
 
-            self.imports_by_file[path].append(
-                module
-            )
 
-            self.add_import_edge(
-                path,
-                module,
-                line_number(node),
-            )
+# ============================================================
+# TREE WALK
+# ============================================================
 
-    # ========================================================
-    # Generic call extraction
-    # ========================================================
+def walk_tree(root):
+    stack = [root]
 
-    def extract_generic_calls(
-        self,
-        path,
-        node,
-        source,
-        language,
-        current_symbol=None,
-    ):
+    while stack:
+        node = stack.pop()
 
-        for current in self.walk(node):
+        yield node
 
-            if current.type not in {
-                "call",
-                "call_expression",
-                "method_invocation",
-                "new_expression",
-                "object_creation_expression",
-            }:
-                continue
-
-            function_node = (
-                current.child_by_field_name("function")
-                or current.child_by_field_name("name")
-                or current.child_by_field_name("constructor")
-            )
-
-            if not function_node:
-                continue
-
-            name = node_text(
-                function_node,
-                source,
-            )
-
-            # Clean member calls:
-            #
-            # user.save()
-            # service.getUser()
-            #
-            # -> getUser
-            if "." in name:
-                name = name.split(".")[-1]
-
-            name = name.strip()
-
-            if not name:
-                continue
-
-            target = self.resolve_symbol(
-                name,
-                path,
-            )
-
-            if not target:
-                continue
-
-            source_symbol = current_symbol
-
-            if not source_symbol:
-                source_symbol = self.find_containing_symbol(
-                    path,
-                    current,
-                )
-
-            if not source_symbol:
-                source_symbol = self.files[path]["node_id"]
-
-            edge_type = (
-                "instantiates"
-                if current.type in {
-                    "new_expression",
-                    "object_creation_expression",
-                }
-                else "calls"
-            )
-
-            self.graph.add_edge(
-                source_symbol,
-                target,
-                edge_type,
-                line_number(current),
-            )
-
-            self.file_relationships[path].add(
-                self.graph.nodes[target].get("file")
-            )
-
-    # ========================================================
-    # Python calls
-    # ========================================================
-
-    def extract_python_calls(
-        self,
-        path,
-        node,
-        source,
-        current_symbol,
-    ):
-
-        self.extract_generic_calls(
-            path,
-            node,
-            source,
-            language="python",
-            current_symbol=current_symbol,
+        stack.extend(
+            reversed(node.children)
         )
 
-    # ========================================================
-    # Find containing symbol
-    # ========================================================
+
+# ============================================================
+# CALL EXTRACTION
+# ============================================================
+
+def extract_calls(
+    root,
+    source: bytes,
+    file_path: str,
+):
+    calls = []
+
+    for node in walk_tree(root):
+
+        if node.type in (
+            "call",
+            "call_expression",
+            "method_invocation",
+        ):
+            function_node = (
+                node.child_by_field_name("function")
+                or node.child_by_field_name("name")
+            )
+
+            if function_node:
+                name = node_text(
+                    function_node,
+                    source,
+                )
+
+                calls.append({
+                    "name": name,
+                    "line": line_number(node),
+                })
+
+        elif node.type in (
+            "new_expression",
+            "object_creation_expression",
+        ):
+            type_node = (
+                node.child_by_field_name("type")
+            )
+
+            if type_node:
+                name = node_text(
+                    type_node,
+                    source,
+                )
+
+                calls.append({
+                    "name": name,
+                    "line": line_number(node),
+                    "instantiation": True,
+                })
+
+    return calls
+
+
+# ============================================================
+# SYMBOL RESOLUTION
+# ============================================================
+
+def resolve_symbol(
+    name: str,
+    symbols_by_name: dict[str, list[str]],
+):
+    candidates = symbols_by_name.get(name, [])
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+
+# ============================================================
+# IMPORT RESOLUTION
+# ============================================================
+
+def resolve_import(
+    import_name: str,
+    current_file: str,
+    file_paths: set[str],
+    language: str,
+):
+    import_name = import_name.strip()
+
+    if not import_name:
+        return None
+
+    if language == "python":
+        module_path = import_name.replace(
+            ".",
+            "/",
+        )
+
+        candidates = [
+            f"{module_path}.py",
+            f"{module_path}/__init__.py",
+        ]
+
+        for candidate in candidates:
+            if candidate in file_paths:
+                return candidate
+
+    elif language in (
+        "javascript",
+        "typescript",
+        "tsx",
+    ):
+        if not import_name.startswith("."):
+            return None
+
+        current_dir = os.path.dirname(
+            current_file
+        )
+
+        candidate = normalize_path(
+            os.path.normpath(
+                os.path.join(
+                    current_dir,
+                    import_name,
+                )
+            )
+        )
+
+        candidates = [
+            candidate,
+            candidate + ".js",
+            candidate + ".jsx",
+            candidate + ".ts",
+            candidate + ".tsx",
+            candidate + "/index.js",
+            candidate + "/index.jsx",
+            candidate + "/index.ts",
+            candidate + "/index.tsx",
+        ]
+
+        for item in candidates:
+            item = normalize_path(item)
+
+            if item in file_paths:
+                return item
+
+    elif language == "java":
+        java_path = (
+            import_name
+            .replace(".", "/")
+            + ".java"
+        )
+
+        if java_path in file_paths:
+            return java_path
+
+    return None
+
+
+# ============================================================
+# REPOSITORY ANALYZER
+# ============================================================
+
+class RepositoryAnalyzer:
+
+    def __init__(
+        self,
+        github: GitHubClient,
+        owner: str,
+        repo: str,
+        max_files: int,
+    ):
+        self.github = github
+        self.owner = owner
+        self.repo = repo
+        self.max_files = max_files
+
+        self.graph = Graph()
+
+        self.file_symbols: dict[
+            str,
+            list[dict]
+        ] = {}
+
+        self.symbols_by_name: dict[
+            str,
+            list[str]
+        ] = {}
+
+        self.file_languages: dict[
+            str,
+            str
+        ] = {}
+
+        self.file_paths: set[str] = set()
+
+    def analyze(self):
+
+        # ----------------------------------------------------
+        # Repository metadata
+        # ----------------------------------------------------
+
+        repository = self.github.get_repository(
+            self.owner,
+            self.repo,
+        )
+
+        default_branch = repository[
+            "default_branch"
+        ]
+
+        # ----------------------------------------------------
+        # Resolve branch SHA
+        # ----------------------------------------------------
+
+        branch_response = self.github.request(
+            "GET",
+            f"{GITHUB_API_URL}/repos/"
+            f"{self.owner}/{self.repo}/branches/"
+            f"{default_branch}",
+        ).json()
+
+        tree_sha = branch_response[
+            "commit"
+        ]["commit"]["tree"]["sha"]
+
+        # ----------------------------------------------------
+        # Repository node
+        # ----------------------------------------------------
+
+        repo_id = make_id(
+            self.owner,
+            self.repo,
+        )
+
+        self.graph.add_node(
+            repo_id,
+            "repository",
+            self.repo,
+            None,
+            None,
+            owner=self.owner,
+            default_branch=default_branch,
+        )
+
+        # ----------------------------------------------------
+        # Recursive tree
+        # ----------------------------------------------------
+
+        ast = self.github.get_tree(
+            self.owner,
+            self.repo,
+            tree_sha,
+        )
+
+        entries = ast.get(
+            "tree",
+            [],
+        )
+
+        source_files = []
+
+        for entry in entries:
+
+            if entry.get("type") != "blob":
+                continue
+
+            path = normalize_path(
+                entry.get("path", "")
+            )
+
+            if should_ignore(path):
+                continue
+
+            language = language_for_path(path)
+
+            if not language:
+                continue
+
+            size = entry.get(
+                "size",
+                0,
+            )
+
+            if size and size > MAX_FILE_SIZE:
+                continue
+
+            source_files.append(
+                (path, language, entry)
+            )
+
+        source_files = source_files[
+            :self.max_files
+        ]
+
+        self.file_paths = {
+            path
+            for path, _, _ in source_files
+        }
+
+        # ----------------------------------------------------
+        # Directory nodes
+        # ----------------------------------------------------
+
+        directories = set()
+
+        for path, _, _ in source_files:
+
+            parts = path.split("/")
+
+            current = ""
+
+            for part in parts[:-1]:
+
+                current = (
+                    f"{current}/{part}"
+                    if current
+                    else part
+                )
+
+                directories.add(current)
+
+        for directory in sorted(
+            directories,
+            key=lambda x: x.count("/"),
+        ):
+            directory_id = make_id(
+                repo_id,
+                directory,
+            )
+
+            self.graph.add_node(
+                directory_id,
+                "directory",
+                directory.split("/")[-1],
+                None,
+                None,
+                path=directory,
+            )
+
+        # ----------------------------------------------------
+        # File nodes
+        # ----------------------------------------------------
+
+        for path, language, entry in source_files:
+
+            self.file_languages[path] = language
+
+            file_id = make_id(
+                repo_id,
+                path,
+            )
+
+            self.graph.add_node(
+                file_id,
+                "file",
+                path.split("/")[-1],
+                path,
+                None,
+                language=language,
+                size=entry.get("size", 0),
+            )
+
+            # Repository -> directory/file
+            parts = path.split("/")
+
+            if len(parts) == 1:
+                self.graph.add_edge(
+                    repo_id,
+                    file_id,
+                    "contains",
+                )
+
+            else:
+                directory = "/".join(
+                    parts[:-1]
+                )
+
+                directory_id = make_id(
+                    repo_id,
+                    directory,
+                )
+
+                self.graph.add_edge(
+                    directory_id,
+                    file_id,
+                    "contains",
+                )
+
+                parent = parts[:-1]
+
+                if len(parent) > 1:
+                    for i in range(1, len(parent)):
+                        parent_path = "/".join(
+                            parent[:i]
+                        )
+
+                        parent_id = make_id(
+                            repo_id,
+                            parent_path,
+                        )
+
+                        child_path = "/".join(
+                            parent[:i + 1]
+                        )
+
+                        child_id = make_id(
+                            repo_id,
+                            child_path,
+                        )
+
+                        self.graph.add_edge(
+                            parent_id,
+                            child_id,
+                            "contains",
+                        )
+
+        # ----------------------------------------------------
+        # Parse files
+        # ----------------------------------------------------
+
+        for path, language, entry in source_files:
+
+            blob = self.github.get_blob(
+                self.owner,
+                self.repo,
+                entry["sha"],
+            )
+
+            source_text = safe_decode_blob(
+                blob
+            )
+
+            if not source_text:
+                continue
+
+            source_bytes = source_text.encode(
+                "utf-8"
+            )
+
+            parser = create_parser(
+                language
+            )
+
+            tree = parser.parse(
+                source_bytes
+            )
+
+            root = tree.root_node
+
+            file_id = make_id(
+                repo_id,
+                path,
+            )
+
+            if language == "python":
+                symbols = extract_python(
+                    root,
+                    source_bytes,
+                    path,
+                    self.graph,
+                )
+
+            elif language == "java":
+                symbols = extract_java(
+                    root,
+                    source_bytes,
+                    path,
+                    self.graph,
+                )
+
+            else:
+                symbols = extract_javascript(
+                    root,
+                    source_bytes,
+                    path,
+                    self.graph,
+                )
+
+            self.file_symbols[path] = symbols
+
+            # ------------------------------------------------
+            # Register symbols globally
+            # ------------------------------------------------
+
+            for symbol in symbols:
+
+                if "id" not in symbol:
+                    continue
+
+                name = symbol["name"]
+
+                self.symbols_by_name.setdefault(
+                    name,
+                    [],
+                ).append(
+                    symbol["id"]
+                )
+
+                self.graph.add_edge(
+                    file_id,
+                    symbol["id"],
+                    "contains",
+                )
+
+            # ------------------------------------------------
+            # Imports
+            # ------------------------------------------------
+
+            for symbol in symbols:
+
+                if "import" not in symbol:
+                    continue
+
+                imported_file = resolve_import(
+                    symbol["import"],
+                    path,
+                    self.file_paths,
+                    language,
+                )
+
+                if imported_file:
+
+                    imported_file_id = make_id(
+                        repo_id,
+                        imported_file,
+                    )
+
+                    self.graph.add_edge(
+                        file_id,
+                        imported_file_id,
+                        "imports",
+                        symbol.get("line"),
+                    )
+
+            # ------------------------------------------------
+            # Calls
+            # ------------------------------------------------
+
+            calls = extract_calls(
+                root,
+                source_bytes,
+                path,
+            )
+
+            for call in calls:
+
+                target = resolve_symbol(
+                    call["name"],
+                    self.symbols_by_name,
+                )
+
+                if target:
+
+                    caller = self.find_containing_symbol(
+                        path,
+                        call["line"],
+                    )
+
+                    if caller:
+
+                        edge_type = (
+                            "instantiates"
+                            if call.get(
+                                "instantiation"
+                            )
+                            else "calls"
+                        )
+
+                        self.graph.add_edge(
+                            caller,
+                            target,
+                            edge_type,
+                            call["line"],
+                        )
+
+        # ----------------------------------------------------
+        # Dependency edges
+        # ----------------------------------------------------
+
+        self.build_dependency_edges(
+            repo_id
+        )
+
+        # ----------------------------------------------------
+        # Statistics
+        # ----------------------------------------------------
+
+        node_types = {}
+
+        for node in self.graph.nodes.values():
+
+            node_type = node["type"]
+
+            node_types[node_type] = (
+                node_types.get(
+                    node_type,
+                    0,
+                ) + 1
+            )
+
+        edge_types = {}
+
+        for edge in self.graph.edges.values():
+
+            edge_type = edge["type"]
+
+            edge_types[edge_type] = (
+                edge_types.get(
+                    edge_type,
+                    0,
+                ) + 1
+            )
+
+        return {
+            "repository": {
+                "owner": self.owner,
+                "name": self.repo,
+                "url": repository["html_url"],
+                "default_branch": default_branch,
+            },
+            "graph": self.graph.json(),
+            "stats": {
+                "files": len(
+                    self.file_paths
+                ),
+                "nodes": len(
+                    self.graph.nodes
+                ),
+                "edges": len(
+                    self.graph.edges
+                ),
+                "node_types": node_types,
+                "edge_types": edge_types,
+            },
+            "tree_truncated": ast.get(
+                "truncated",
+                False,
+            ),
+        }
 
     def find_containing_symbol(
         self,
-        path,
-        node,
+        file_path: str,
+        line: int,
     ):
-
-        best = None
-        best_span = None
-
-        for symbol_id in self.symbols_by_file[path]:
-
-            graph_node = self.graph.nodes[symbol_id]
-
-            line = graph_node.get("line")
-
-            if line is None:
-                continue
-
-            # Approximate containment based on source position.
-            # The exact Tree-sitter node isn't retained deliberately.
-            if line <= line_number(node):
-
-                if best_span is None or line > best_span:
-                    best = symbol_id
-                    best_span = line
-
-        return best
-
-    # ========================================================
-    # Symbol resolution
-    # ========================================================
-
-    def resolve_symbol(
-        self,
-        name: str,
-        current_file: str,
-    ) -> Optional[str]:
-
-        if not name:
-            return None
-
-        name = name.strip()
-
-        candidates = []
-
-        # Direct name
-        candidates.extend(
-            self.symbols_by_name.get(name, [])
+        symbols = self.file_symbols.get(
+            file_path,
+            [],
         )
 
-        # Java fully-qualified names
-        short_name = name.split(".")[-1]
-
-        if short_name != name:
-            candidates.extend(
-                self.symbols_by_name.get(short_name, [])
-            )
-
-        # Remove duplicates
-        candidates = list(dict.fromkeys(candidates))
+        candidates = [
+            symbol
+            for symbol in symbols
+            if symbol.get("id")
+            and symbol.get("line", 0) <= line
+        ]
 
         if not candidates:
             return None
 
-        # Same file gets priority
-        same_file = [
-            candidate
-            for candidate in candidates
-            if self.graph.nodes[candidate].get("file")
-            == current_file
-        ]
-
-        if len(same_file) == 1:
-            return same_file[0]
-
-        # If exactly one global candidate exists,
-        # resolution is safe enough for v1.
-        if len(candidates) == 1:
-            return candidates[0]
-
-        return None
-
-    # ========================================================
-    # Import edges
-    # ========================================================
-
-    def add_import_edge(
-        self,
-        path,
-        module,
-        line,
-    ):
-
-        target_file = self.resolve_import_to_file(
-            path,
-            module,
+        candidates.sort(
+            key=lambda x: x["line"],
+            reverse=True,
         )
 
-        if target_file:
+        return candidates[0]["id"]
+
+    def build_dependency_edges(
+        self,
+        repo_id: str,
+    ):
+        for edge in list(
+            self.graph.edges.values()
+        ):
+
+            source_node = self.graph.nodes.get(
+                edge["source"]
+            )
+
+            target_node = self.graph.nodes.get(
+                edge["target"]
+            )
+
+            if not source_node or not target_node:
+                continue
+
+            source_file = source_node.get(
+                "file"
+            )
+
+            target_file = target_node.get(
+                "file"
+            )
+
+            if (
+                not source_file
+                or not target_file
+                or source_file == target_file
+            ):
+                continue
+
+            if edge["type"] not in {
+                "imports",
+                "calls",
+                "instantiates",
+                "inherits",
+                "implements",
+            }:
+                continue
+
+            source_file_id = make_id(
+                repo_id,
+                source_file,
+            )
+
+            target_file_id = make_id(
+                repo_id,
+                target_file,
+            )
 
             self.graph.add_edge(
-                self.files[path]["node_id"],
-                self.files[target_file]["node_id"],
-                "imports",
-                line,
+                source_file_id,
+                target_file_id,
+                "depends",
+                edge.get("line"),
             )
-
-            self.file_relationships[path].add(
-                target_file
-            )
-
-    def resolve_import_to_file(
-        self,
-        current_file,
-        module,
-    ):
-
-        module = module.strip()
-
-        if not module:
-            return None
-
-        # ----------------------------------------------------
-        # Python
-        # ----------------------------------------------------
-
-        if self.files[current_file]["language"] == "python":
-
-            module_path = module.replace(".", "/")
-
-            candidates = [
-                f"{module_path}.py",
-                f"{module_path}/__init__.py",
-            ]
-
-            current_dir = os.path.dirname(current_file)
-
-            if module.startswith("."):
-
-                dots = len(module) - len(module.lstrip("."))
-
-                module_name = module.lstrip(".").replace(
-                    ".",
-                    "/",
-                )
-
-                base = current_dir
-
-                for _ in range(max(0, dots - 1)):
-                    base = os.path.dirname(base)
-
-                candidates = [
-                    os.path.join(
-                        base,
-                        module_name + ".py",
-                    ),
-                    os.path.join(
-                        base,
-                        module_name,
-                        "__init__.py",
-                    ),
-                ]
-
-            for candidate in candidates:
-
-                candidate = normalize_path(candidate)
-
-                if candidate in self.files:
-                    return candidate
-
-        # ----------------------------------------------------
-        # JS / TS
-        # ----------------------------------------------------
-
-        if module.startswith("."):
-
-            base_dir = os.path.dirname(
-                current_file
-            )
-
-            raw = normalize_path(
-                os.path.join(
-                    base_dir,
-                    module,
-                )
-            )
-
-            candidates = [
-                raw,
-                raw + ".js",
-                raw + ".jsx",
-                raw + ".ts",
-                raw + ".tsx",
-                raw + "/index.js",
-                raw + "/index.jsx",
-                raw + "/index.ts",
-                raw + "/index.tsx",
-            ]
-
-            for candidate in candidates:
-
-                candidate = normalize_path(candidate)
-
-                if candidate in self.files:
-                    return candidate
-
-        # ----------------------------------------------------
-        # Java
-        # ----------------------------------------------------
-
-        if (
-            self.files[current_file]["language"]
-            == "java"
-        ):
-
-            java_path = module.replace(
-                ".",
-                "/",
-            ) + ".java"
-
-            if java_path in self.files:
-                return java_path
-
-            class_name = module.split(".")[-1]
-
-            for file_path in self.files:
-
-                if (
-                    os.path.basename(file_path)
-                    == f"{class_name}.java"
-                ):
-                    return file_path
-
-        return None
-
-    # ========================================================
-    # Dependency edges
-    # ========================================================
-
-    def build_dependency_edges(self):
-
-        for source_file, targets in (
-            self.file_relationships.items()
-        ):
-
-            source_id = self.files[source_file]["node_id"]
-
-            for target_file in targets:
-
-                if not target_file:
-                    continue
-
-                if target_file not in self.files:
-                    continue
-
-                target_id = self.files[target_file]["node_id"]
-
-                self.graph.add_edge(
-                    source_id,
-                    target_id,
-                    "depends",
-                )
-
-    # ========================================================
-    # Stats
-    # ========================================================
-
-    def get_stats(self):
-
-        nodes = list(
-            self.graph.nodes.values()
-        )
-
-        edges = self.graph.edges
-
-        node_types = defaultdict(int)
-
-        edge_types = defaultdict(int)
-
-        for node in nodes:
-            node_types[node["type"]] += 1
-
-        for edge in edges:
-            edge_types[edge["type"]] += 1
-
-        return {
-            "nodes": len(nodes),
-            "edges": len(edges),
-            "node_types": dict(node_types),
-            "edge_types": dict(edge_types),
-            "files_analyzed": len(self.files),
-            "symbols": sum(
-                1
-                for node in nodes
-                if node["type"] in {
-                    "class",
-                    "interface",
-                    "function",
-                    "method",
-                }
-            ),
-        }
 
 
 # ============================================================
-# API endpoints
+# AUTH HELPERS
+# ============================================================
+
+def get_session_id(
+    request: Request,
+):
+    return request.cookies.get(
+        "codeatlas_session"
+    )
+
+
+def get_session(
+    request: Request,
+):
+    session_id = get_session_id(
+        request
+    )
+
+    if not session_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated with GitHub.",
+        )
+
+    session = SESSIONS.get(
+        session_id
+    )
+
+    if not session:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication session expired.",
+        )
+
+    return session
+
+
+# ============================================================
+# AUTH ROUTES
 # ============================================================
 
 @app.get("/")
 def root():
     return {
-        "name": "CodeAtlas",
-        "version": "1.0.0",
+        "name": "CodeAtlas API",
         "status": "running",
     }
 
 
-@app.post("/api/analyze")
-def analyze_repository(request: AnalyzeRequest):
+@app.get("/auth/github/login")
+def github_login():
 
-    try:
-        owner, repo = parse_github_url(
-            request.repo_url
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-    analysis_id = str(uuid.uuid4())
-
-    try:
-
-        analyzer = RepositoryAnalyzer(
-            owner=owner,
-            repo=repo,
-            token=request.github_token,
-            max_files=min(
-                max(request.max_files, 1),
-                5000,
-            ),
-        )
-
-        result = analyzer.analyze()
-
-        ANALYSES[analysis_id] = result
-
-        return {
-            "analysis_id": analysis_id,
-            "status": "completed",
-            "repository": result["repository"],
-            "stats": result["stats"],
-        }
-
-    except Exception as exc:
-
+    if not GITHUB_CLIENT_ID:
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="GitHub OAuth is not configured.",
         )
 
+    params = {
+        "client_id": GITHUB_CLIENT_ID,
+        "redirect_uri": (
+            f"{BACKEND_URL}/auth/github/callback"
+        ),
+        "scope": "repo read:user user:email",
+    }
 
-@app.get("/api/analysis/{analysis_id}")
-def get_analysis(analysis_id: str):
+    query = "&".join(
+        f"{key}={requests.utils.quote(str(value))}"
+        for key, value in params.items()
+    )
 
-    result = ANALYSES.get(analysis_id)
+    return RedirectResponse(
+        f"{GITHUB_AUTHORIZE_URL}?{query}"
+    )
 
-    if not result:
+
+@app.get("/auth/github/callback")
+def github_callback(
+    code: str,
+):
+
+    response = requests.post(
+        GITHUB_ACCESS_TOKEN_URL,
+        data={
+            "client_id": GITHUB_CLIENT_ID,
+            "client_secret": GITHUB_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": (
+                f"{BACKEND_URL}/auth/github/callback"
+            ),
+        },
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "CodeAtlas/1.0",
+        },
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
         raise HTTPException(
-            status_code=404,
-            detail="Analysis not found",
+            status_code=400,
+            detail="GitHub OAuth token exchange failed.",
         )
+
+    data = response.json()
+
+    access_token = data.get(
+        "access_token"
+    )
+
+    if not access_token:
+        raise HTTPException(
+            status_code=400,
+            detail="GitHub did not return an access token.",
+        )
+
+    # --------------------------------------------------------
+    # Get authenticated GitHub user
+    # --------------------------------------------------------
+
+    github_response = requests.get(
+        f"{GITHUB_API_URL}/user",
+        headers={
+            "Authorization": (
+                f"Bearer {access_token}"
+            ),
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "CodeAtlas/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=30,
+    )
+
+    if github_response.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not retrieve GitHub user.",
+        )
+
+    github_user = github_response.json()
+
+    # --------------------------------------------------------
+    # Create server-side session
+    # --------------------------------------------------------
+
+    session_id = uuid.uuid4().hex
+
+    SESSIONS[session_id] = {
+        "github_access_token": access_token,
+        "github_user": {
+            "id": github_user.get("id"),
+            "login": github_user.get("login"),
+            "name": github_user.get("name"),
+            "avatar_url": github_user.get(
+                "avatar_url"
+            ),
+            "html_url": github_user.get(
+                "html_url"
+            ),
+        },
+    }
+
+    response = RedirectResponse(
+        FRONTEND_URL
+    )
+
+    response.set_cookie(
+        key="codeatlas_session",
+        value=session_id,
+        httponly=True,
+        secure=False,       # True in HTTPS production
+        samesite="lax",
+        max_age=60 * 60 * 24,
+        path="/",
+    )
+
+    return response
+
+
+@app.get("/auth/me")
+def get_current_user(
+    request: Request,
+):
+    session = get_session(
+        request
+    )
 
     return {
-        "analysis_id": analysis_id,
-        "status": "completed",
-        "repository": result["repository"],
-        "stats": result["stats"],
-        "tree_truncated": result["tree_truncated"],
+        "authenticated": True,
+        "user": session["github_user"],
     }
 
 
-@app.get("/api/analysis/{analysis_id}/graph")
-def get_graph(analysis_id: str):
+@app.post("/auth/logout")
+def logout(
+    request: Request,
+):
 
-    result = ANALYSES.get(analysis_id)
+    session_id = get_session_id(
+        request
+    )
 
-    if not result:
-        raise HTTPException(
-            status_code=404,
-            detail="Analysis not found",
+    if session_id:
+        SESSIONS.pop(
+            session_id,
+            None,
         )
 
-    return {
-        "repository": result["repository"],
-        "nodes": result["nodes"],
-        "edges": result["edges"],
-        "adjacency": result["adjacency"],
-        "stats": result["stats"],
+    response = {
+        "authenticated": False,
     }
+
+    return response
 
 
 # ============================================================
-# Local execution
+# ANALYZE REQUEST
+# ============================================================
+
+class AnalyzeRequest(BaseModel):
+    repo_url: str
+    max_files: int = DEFAULT_MAX_FILES
+
+
+# ============================================================
+# ANALYZE
+# ============================================================
+
+@app.post("/api/analyze")
+def analyze_repository(
+    request: AnalyzeRequest,
+    http_request: Request,
+):
+
+    session = get_session(
+        http_request
+    )
+
+    if request.max_files < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="max_files must be greater than 0.",
+        )
+
+    github_token = session[
+        "github_access_token"
+    ]
+
+    owner, repo = parse_github_url(
+        request.repo_url
+    )
+
+    github = GitHubClient(
+        github_token
+    )
+
+    analyzer = RepositoryAnalyzer(
+        github=github,
+        owner=owner,
+        repo=repo,
+        max_files=request.max_files,
+    )
+
+    # IMPORTANT:
+    #
+    # The graph is generated and immediately returned.
+    #
+    # It is NOT stored in SESSIONS.
+    # It is NOT stored in an ANALYSES dictionary.
+    #
+
+    result = analyzer.analyze()
+
+    return result
+
+
+# ============================================================
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
-
     import uvicorn
 
     uvicorn.run(

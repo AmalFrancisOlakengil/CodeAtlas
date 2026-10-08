@@ -1,7 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+
+import type { ForceGraphMethods } from "react-force-graph-2d";
+
 
 const ForceGraph2D = dynamic(
   () => import("react-force-graph-2d"),
@@ -12,7 +20,16 @@ const ForceGraph2D = dynamic(
 
 
 // ============================================================
-// Types
+// ENV
+// ============================================================
+
+const API_URL =
+  process.env.NEXT_PUBLIC_API_URL ||
+  "http://localhost:8000";
+
+
+// ============================================================
+// TYPES
 // ============================================================
 
 type NodeType =
@@ -37,95 +54,125 @@ interface GraphNode {
   id: string;
   type: NodeType;
   name: string;
-  file?: string;
-  line?: number;
+  file?: string | null;
+  line?: number | null;
   language?: string;
+  path?: string;
+  owner?: string;
+  default_branch?: string;
+  size?: number;
 }
 
 interface GraphEdge {
   source: string | GraphNode;
   target: string | GraphNode;
   type: EdgeType;
-  line?: number;
+  line?: number | null;
 }
 
 interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
-  adjacency: Record<
-    string,
-    Record<string, string[]>
-  >;
-  repository: {
-    owner: string;
-    name: string;
-    full_name: string;
-    default_branch: string;
-    stars: number;
-    language?: string;
-  };
-  stats: {
-    nodes: number;
-    edges: number;
-    files_analyzed: number;
-    symbols: number;
-    node_types: Record<string, number>;
-    edge_types: Record<string, number>;
-  };
+}
+
+interface RepositoryInfo {
+  owner: string;
+  name: string;
+  url: string;
+  default_branch: string;
+}
+
+interface AnalysisStats {
+  files: number;
+  nodes: number;
+  edges: number;
+  node_types: Record<string, number>;
+  edge_types: Record<string, number>;
 }
 
 interface AnalysisResponse {
-  analysis_id: string;
-  status: string;
-  repository: GraphData["repository"];
-  stats: GraphData["stats"];
+  repository: RepositoryInfo;
+  graph: GraphData;
+  stats: AnalysisStats;
+  tree_truncated: boolean;
+}
+
+interface GithubUser {
+  id: number;
+  login: string;
+  name?: string | null;
+  avatar_url?: string;
+  html_url?: string;
+}
+
+interface AuthResponse {
+  authenticated: boolean;
+  user?: GithubUser;
 }
 
 
 // ============================================================
-// Constants
+// COLORS
 // ============================================================
 
-const API_URL =
-  process.env.NEXT_PUBLIC_API_URL ||
-  "http://localhost:8000";
-
-const NODE_COLORS: Record<string, string> = {
+const NODE_COLORS: Record<NodeType, string> = {
   repository: "#f97316",
   directory: "#a855f7",
-  file: "#3b82f6",
-  class: "#22c55e",
-  interface: "#14b8a6",
-  function: "#eab308",
-  method: "#ec4899",
+  file: "#64748b",
+  class: "#3b82f6",
+  interface: "#06b6d4",
+  function: "#22c55e",
+  method: "#eab308",
 };
 
-const EDGE_COLORS: Record<string, string> = {
+const EDGE_COLORS: Record<EdgeType, string> = {
   contains: "#64748b",
-  imports: "#3b82f6",
+  imports: "#8b5cf6",
   calls: "#22c55e",
-  inherits: "#a855f7",
-  implements: "#14b8a6",
+  inherits: "#3b82f6",
+  implements: "#06b6d4",
   instantiates: "#eab308",
-  depends: "#ef4444",
+  depends: "#f97316",
 };
 
 
 // ============================================================
-// Main component
+// COMPONENT
 // ============================================================
 
 export default function Home() {
 
-  const [repoUrl, setRepoUrl] = useState("");
+  // ----------------------------------------------------------
+  // AUTH
+  // ----------------------------------------------------------
 
-  const [maxFiles, setMaxFiles] = useState(500);
+  const [user, setUser] =
+    useState<GithubUser | null>(null);
 
-  const [analysisId, setAnalysisId] =
-    useState<string | null>(null);
+  const [authLoading, setAuthLoading] =
+    useState(true);
+
+  // ----------------------------------------------------------
+  // ANALYSIS
+  // ----------------------------------------------------------
+
+  const [repoUrl, setRepoUrl] =
+    useState("");
+
+  const [maxFiles, setMaxFiles] =
+    useState(500);
 
   const [graph, setGraph] =
     useState<GraphData | null>(null);
+
+  const [repository, setRepository] =
+    useState<RepositoryInfo | null>(null);
+
+  const [stats, setStats] =
+    useState<AnalysisStats | null>(null);
+
+  const [treeTruncated, setTreeTruncated] =
+    useState(false);
 
   const [loading, setLoading] =
     useState(false);
@@ -136,332 +183,544 @@ export default function Home() {
   const [selectedNode, setSelectedNode] =
     useState<GraphNode | null>(null);
 
+  // ----------------------------------------------------------
+  // FILTERS
+  // ----------------------------------------------------------
+
   const [search, setSearch] =
     useState("");
 
-  const [visibleTypes, setVisibleTypes] =
-    useState<Record<string, boolean>>({
-      repository: true,
-      directory: true,
-      file: true,
-      class: true,
-      interface: true,
-      function: true,
-      method: true,
-    });
+  const [visibleNodeTypes, setVisibleNodeTypes] =
+    useState<Set<NodeType>>(
+      new Set([
+        "repository",
+        "directory",
+        "file",
+        "class",
+        "interface",
+        "function",
+        "method",
+      ])
+    );
 
-  const [visibleEdges, setVisibleEdges] =
-    useState<Record<string, boolean>>({
-      contains: true,
-      imports: true,
-      calls: true,
-      inherits: true,
-      implements: true,
-      instantiates: true,
-      depends: true,
-    });
+  const [visibleEdgeTypes, setVisibleEdgeTypes] =
+    useState<Set<EdgeType>>(
+      new Set([
+        "contains",
+        "imports",
+        "calls",
+        "inherits",
+        "implements",
+        "instantiates",
+        "depends",
+      ])
+    );
 
 
   // ==========================================================
-  // Analyze
+  // AUTHENTICATION
   // ==========================================================
 
-  const analyzeRepository = async () => {
+  const checkAuthentication =
+    useCallback(async () => {
 
-    if (!repoUrl.trim()) {
-      setError("Enter a GitHub repository URL.");
-      return;
-    }
+      try {
 
-    setLoading(true);
-    setError("");
-    setGraph(null);
-    setSelectedNode(null);
+        const response = await fetch(
+          `${API_URL}/auth/me`,
+          {
+            credentials: "include",
+          }
+        );
+
+        if (!response.ok) {
+          setUser(null);
+          return;
+        }
+
+        const data: AuthResponse =
+          await response.json();
+
+        if (data.authenticated && data.user) {
+          setUser(data.user);
+        } else {
+          setUser(null);
+        }
+
+      } catch {
+        setUser(null);
+      } finally {
+        setAuthLoading(false);
+      }
+
+    }, []);
+
+
+  useEffect(() => {
+    checkAuthentication();
+  }, [checkAuthentication]);
+
+
+  const loginWithGithub = () => {
+
+    window.location.href =
+      `${API_URL}/auth/github/login`;
+
+  };
+
+
+  const logout = async () => {
 
     try {
 
-      const response = await fetch(
-        `${API_URL}/api/analyze`,
+      await fetch(
+        `${API_URL}/auth/logout`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            repo_url: repoUrl,
-            max_files: maxFiles,
-          }),
+          credentials: "include",
         }
       );
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data.detail ||
-          "Analysis failed."
-        );
-      }
-
-      setAnalysisId(
-        data.analysis_id
-      );
-
-      const graphResponse =
-        await fetch(
-          `${API_URL}/api/analysis/${data.analysis_id}/graph`
-        );
-
-      const graphData =
-        await graphResponse.json();
-
-      if (!graphResponse.ok) {
-        throw new Error(
-          graphData.detail ||
-          "Could not retrieve graph."
-        );
-      }
-
-      setGraph(graphData);
-
-    } catch (err) {
-
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Something went wrong."
-      );
-
     } finally {
-      setLoading(false);
+
+      setUser(null);
+
+      // Graph is client-side state.
+      setGraph(null);
+      setRepository(null);
+      setStats(null);
+      setSelectedNode(null);
     }
   };
 
 
   // ==========================================================
-  // Keyboard shortcut
+  // ANALYZE REPOSITORY
   // ==========================================================
 
-  useEffect(() => {
+  const analyzeRepository =
+    useCallback(async () => {
 
-    const handler = (event: KeyboardEvent) => {
+      if (!repoUrl.trim()) {
+        setError(
+          "Enter a GitHub repository URL."
+        );
+        return;
+      }
+
+      if (!user) {
+        setError(
+          "Please sign in with GitHub first."
+        );
+        return;
+      }
+
+      setLoading(true);
+      setError("");
+      setSelectedNode(null);
+
+      try {
+
+        const response = await fetch(
+          `${API_URL}/api/analyze`,
+          {
+            method: "POST",
+
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+
+            credentials: "include",
+
+            body: JSON.stringify({
+              repo_url: repoUrl,
+              max_files: maxFiles,
+            }),
+          }
+        );
+
+        const data =
+          await response.json();
+
+        if (!response.ok) {
+
+          throw new Error(
+            data?.detail
+              ? typeof data.detail ===
+                "string"
+                ? data.detail
+                : JSON.stringify(
+                    data.detail
+                  )
+              : "Analysis failed."
+          );
+        }
+
+        const result =
+          data as AnalysisResponse;
+
+        // ----------------------------------------------------
+        // IMPORTANT:
+        //
+        // The graph lives ONLY in React/browser memory.
+        //
+        // Backend does not retain it.
+        // ----------------------------------------------------
+
+        setGraph(result.graph);
+        setRepository(
+          result.repository
+        );
+        setStats(result.stats);
+        setTreeTruncated(
+          result.tree_truncated
+        );
+
+      } catch (err) {
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Analysis failed."
+        );
+
+      } finally {
+
+        setLoading(false);
+
+      }
+
+    }, [
+      repoUrl,
+      maxFiles,
+      user,
+    ]);
+
+
+  // ==========================================================
+  // KEYBOARD SHORTCUT
+  // ==========================================================
+
+  const handleKeyDown =
+    (event: React.KeyboardEvent<HTMLInputElement>) => {
 
       if (
         event.key === "Enter" &&
-        (event.ctrlKey || event.metaKey)
+        event.ctrlKey
       ) {
         analyzeRepository();
       }
+
     };
-
-    window.addEventListener(
-      "keydown",
-      handler
-    );
-
-    return () => {
-      window.removeEventListener(
-        "keydown",
-        handler
-      );
-    };
-
-  }, [repoUrl, maxFiles]);
 
 
   // ==========================================================
-  // Filter graph
+  // FILTER GRAPH
   // ==========================================================
 
-  const filteredGraph = useMemo(() => {
+  const filteredGraph =
+    useMemo(() => {
 
-    if (!graph) {
+      if (!graph) {
+        return {
+          nodes: [],
+          edges: [],
+        };
+      }
+
+      const query =
+        search
+          .trim()
+          .toLowerCase();
+
+      const nodes =
+        graph.nodes.filter(
+          (node) => {
+
+            if (
+              !visibleNodeTypes.has(
+                node.type
+              )
+            ) {
+              return false;
+            }
+
+            if (!query) {
+              return true;
+            }
+
+            return (
+              node.name
+                .toLowerCase()
+                .includes(query) ||
+              node.file
+                ?.toLowerCase()
+                .includes(query) ||
+              node.path
+                ?.toLowerCase()
+                .includes(query)
+            );
+          }
+        );
+
+      const nodeIds =
+        new Set(
+          nodes.map(
+            (node) => node.id
+          )
+        );
+
+      const edges =
+        graph.edges.filter(
+          (edge) => {
+
+            if (
+              !visibleEdgeTypes.has(
+                edge.type
+              )
+            ) {
+              return false;
+            }
+
+            const sourceId =
+              typeof edge.source ===
+              "string"
+                ? edge.source
+                : edge.source.id;
+
+            const targetId =
+              typeof edge.target ===
+              "string"
+                ? edge.target
+                : edge.target.id;
+
+            return (
+              nodeIds.has(sourceId) &&
+              nodeIds.has(targetId)
+            );
+          }
+        );
+
       return {
-        nodes: [],
-        links: [],
+        nodes,
+        edges,
       };
-    }
 
-    const query =
-      search.trim().toLowerCase();
-
-    const visibleNodeIds = new Set(
-      graph.nodes
-        .filter((node) => {
-
-          if (!visibleTypes[node.type]) {
-            return false;
-          }
-
-          if (!query) {
-            return true;
-          }
-
-          return (
-            node.name
-              .toLowerCase()
-              .includes(query) ||
-            node.file
-              ?.toLowerCase()
-              .includes(query)
-          );
-        })
-        .map((node) => node.id)
-    );
-
-    const nodes =
-      graph.nodes.filter(
-        (node) =>
-          visibleNodeIds.has(node.id)
-      );
-
-    const links =
-      graph.edges
-        .filter((edge) => {
-
-          if (!visibleEdges[edge.type]) {
-            return false;
-          }
-
-          const source =
-            typeof edge.source === "string"
-              ? edge.source
-              : edge.source.id;
-
-          const target =
-            typeof edge.target === "string"
-              ? edge.target
-              : edge.target.id;
-
-          return (
-            visibleNodeIds.has(source) &&
-            visibleNodeIds.has(target)
-          );
-        })
-        .map((edge) => ({
-          ...edge,
-          source:
-            typeof edge.source === "string"
-              ? edge.source
-              : edge.source.id,
-          target:
-            typeof edge.target === "string"
-              ? edge.target
-              : edge.target.id,
-        }));
-
-    return {
-      nodes,
-      links,
-    };
-
-  }, [
-    graph,
-    search,
-    visibleTypes,
-    visibleEdges,
-  ]);
+    }, [
+      graph,
+      search,
+      visibleNodeTypes,
+      visibleEdgeTypes,
+    ]);
 
 
   // ==========================================================
-  // Toggle helpers
+  // TOGGLE HELPERS
   // ==========================================================
 
   const toggleNodeType =
-    useCallback((type: string) => {
+    (type: NodeType) => {
 
-      setVisibleTypes((previous) => ({
-        ...previous,
-        [type]: !previous[type],
-      }));
+      setVisibleNodeTypes(
+        (previous) => {
 
-    }, []);
+          const next =
+            new Set(previous);
+
+          if (next.has(type)) {
+            next.delete(type);
+          } else {
+            next.add(type);
+          }
+
+          return next;
+        }
+      );
+    };
 
 
   const toggleEdgeType =
-    useCallback((type: string) => {
+    (type: EdgeType) => {
 
-      setVisibleEdges((previous) => ({
-        ...previous,
-        [type]: !previous[type],
-      }));
+      setVisibleEdgeTypes(
+        (previous) => {
 
-    }, []);
+          const next =
+            new Set(previous);
+
+          if (next.has(type)) {
+            next.delete(type);
+          } else {
+            next.add(type);
+          }
+
+          return next;
+        }
+      );
+    };
 
 
   // ==========================================================
-  // Render
+  // LOADING
+  // ==========================================================
+
+  if (authLoading) {
+
+    return (
+      <main className="min-h-screen bg-zinc-950 text-white flex items-center justify-center">
+        <div className="text-zinc-400">
+          Checking GitHub authentication...
+        </div>
+      </main>
+    );
+
+  }
+
+
+  // ==========================================================
+  // AUTH SCREEN
+  // ==========================================================
+
+  if (!user) {
+
+    return (
+      <main className="min-h-screen bg-zinc-950 text-white flex items-center justify-center px-6">
+
+        <div className="w-full max-w-md">
+
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900 p-8 shadow-2xl">
+
+            <div className="mb-8">
+
+              <h1 className="text-3xl font-bold tracking-tight">
+                CodeAtlas
+              </h1>
+
+              <p className="mt-2 text-sm text-zinc-400">
+                Static code intelligence for
+                GitHub repositories.
+              </p>
+
+            </div>
+
+            <button
+              onClick={loginWithGithub}
+              className="w-full rounded-xl bg-white px-5 py-3 font-semibold text-black transition hover:bg-zinc-200"
+            >
+              Continue with GitHub
+            </button>
+
+            <p className="mt-5 text-xs leading-5 text-zinc-500">
+              CodeAtlas uses your GitHub
+              authorization to access repositories
+              through the GitHub API.
+            </p>
+
+          </div>
+
+        </div>
+
+      </main>
+    );
+
+  }
+
+
+  // ==========================================================
+  // MAIN UI
   // ==========================================================
 
   return (
-    <main className="min-h-screen bg-[#09090b] text-white">
+    <main className="min-h-screen bg-zinc-950 text-white">
 
-      {/* =====================================================
-          Header
-      ====================================================== */}
+      {/* HEADER */}
 
-      <header className="border-b border-white/10">
+      <header className="border-b border-zinc-800">
 
-        <div className="mx-auto flex max-w-[1600px] items-center justify-between px-6 py-4">
+        <div className="mx-auto flex max-w-[1800px] items-center justify-between px-6 py-4">
 
           <div>
-            <h1 className="text-xl font-semibold">
+
+            <h1 className="text-xl font-bold">
               CodeAtlas
             </h1>
 
             <p className="text-xs text-zinc-500">
               Static code intelligence
             </p>
+
           </div>
 
-          {graph && (
-            <div className="text-xs text-zinc-500">
-              {graph.repository.full_name}
+          <div className="flex items-center gap-4">
+
+            <div className="flex items-center gap-2">
+
+              {user.avatar_url && (
+                <img
+                  src={user.avatar_url}
+                  alt={user.login}
+                  className="h-8 w-8 rounded-full"
+                />
+              )}
+
+              <span className="text-sm text-zinc-300">
+                @{user.login}
+              </span>
+
             </div>
-          )}
+
+            <button
+              onClick={logout}
+              className="rounded-lg border border-zinc-700 px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-800"
+            >
+              Logout
+            </button>
+
+          </div>
 
         </div>
 
       </header>
 
 
-      {/* =====================================================
-          Repository input
-      ====================================================== */}
+      {/* ANALYSIS BAR */}
 
-      <section className="border-b border-white/10 bg-[#0c0c0f]">
+      <section className="border-b border-zinc-800">
 
-        <div className="mx-auto max-w-[1600px] px-6 py-5">
+        <div className="mx-auto max-w-[1800px] px-6 py-5">
 
-          <div className="flex flex-col gap-3 md:flex-row">
+          <div className="flex gap-3">
 
             <input
               value={repoUrl}
               onChange={(event) =>
-                setRepoUrl(event.target.value)
+                setRepoUrl(
+                  event.target.value
+                )
               }
+              onKeyDown={handleKeyDown}
               placeholder="https://github.com/owner/repository"
-              className="flex-1 rounded-lg border border-white/10 bg-[#151518] px-4 py-3 text-sm outline-none transition focus:border-blue-500"
+              className="min-w-0 flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm outline-none placeholder:text-zinc-600 focus:border-zinc-500"
             />
 
             <input
               type="number"
               min={1}
-              max={5000}
               value={maxFiles}
               onChange={(event) =>
                 setMaxFiles(
                   Number(event.target.value)
                 )
               }
+              className="w-28 rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm outline-none focus:border-zinc-500"
               title="Maximum source files"
-              className="w-full rounded-lg border border-white/10 bg-[#151518] px-4 py-3 text-sm outline-none focus:border-blue-500 md:w-32"
             />
 
             <button
               onClick={analyzeRepository}
               disabled={loading}
-              className="rounded-lg bg-white px-6 py-3 text-sm font-medium text-black transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-xl bg-white px-6 py-3 text-sm font-semibold text-black transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {loading
                 ? "Analyzing..."
@@ -470,24 +729,17 @@ export default function Home() {
 
           </div>
 
-          <div className="mt-2 flex items-center justify-between">
-
-            <p className="text-xs text-zinc-600">
-              Ctrl + Enter to analyze
-            </p>
-
-            {analysisId && (
-              <p className="text-xs text-zinc-600">
-                Analysis:{" "}
-                {analysisId.slice(0, 8)}
-              </p>
-            )}
-
-          </div>
-
           {error && (
-            <div className="mt-4 rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-400">
+            <div className="mt-3 rounded-lg border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-300">
               {error}
+            </div>
+          )}
+
+          {treeTruncated && (
+            <div className="mt-3 rounded-lg border border-yellow-900 bg-yellow-950/30 px-4 py-3 text-sm text-yellow-300">
+              GitHub reported a truncated
+              repository tree. The displayed
+              graph may not contain every file.
             </div>
           )}
 
@@ -496,403 +748,36 @@ export default function Home() {
       </section>
 
 
-      {/* =====================================================
-          Dashboard
-      ====================================================== */}
+      {/* STATS */}
 
-      {graph && (
+      {stats && (
 
-        <div className="mx-auto max-w-[1600px] px-6 py-6">
+        <section className="border-b border-zinc-800">
 
-          {/* Stats */}
-
-          <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div className="mx-auto grid max-w-[1800px] grid-cols-2 gap-px bg-zinc-800 md:grid-cols-4">
 
             <Stat
               label="Files"
-              value={graph.stats.files_analyzed}
-            />
-
-            <Stat
-              label="Symbols"
-              value={graph.stats.symbols}
+              value={stats.files}
             />
 
             <Stat
               label="Nodes"
-              value={graph.stats.nodes}
+              value={stats.nodes}
             />
 
             <Stat
               label="Edges"
-              value={graph.stats.edges}
+              value={stats.edges}
             />
 
             <Stat
-              label="Stars"
-              value={graph.repository.stars}
+              label="Branch"
+              value={
+                repository?.default_branch ||
+                "-"
+              }
             />
-
-          </div>
-
-
-          {/* =================================================
-              Main workspace
-          ================================================= */}
-
-          <div className="grid min-h-[700px] grid-cols-1 overflow-hidden rounded-xl border border-white/10 bg-[#0c0c0f] lg:grid-cols-[240px_1fr_280px]">
-
-
-            {/* =================================================
-                Left controls
-            ================================================= */}
-
-            <aside className="border-b border-white/10 p-4 lg:border-b-0 lg:border-r">
-
-              <p className="mb-4 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-                Node types
-              </p>
-
-              <div className="space-y-2">
-
-                {Object.keys(
-                  visibleTypes
-                ).map((type) => (
-
-                  <FilterRow
-                    key={type}
-                    label={type}
-                    checked={
-                      visibleTypes[type]
-                    }
-                    color={
-                      NODE_COLORS[type]
-                    }
-                    onClick={() =>
-                      toggleNodeType(type)
-                    }
-                  />
-
-                ))}
-
-              </div>
-
-
-              <div className="my-6 border-t border-white/10" />
-
-
-              <p className="mb-4 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-                Edge types
-              </p>
-
-              <div className="space-y-2">
-
-                {Object.keys(
-                  visibleEdges
-                ).map((type) => (
-
-                  <FilterRow
-                    key={type}
-                    label={type}
-                    checked={
-                      visibleEdges[type]
-                    }
-                    color={
-                      EDGE_COLORS[type]
-                    }
-                    onClick={() =>
-                      toggleEdgeType(type)
-                    }
-                  />
-
-                ))}
-
-              </div>
-
-            </aside>
-
-
-            {/* =================================================
-                Graph
-            ================================================= */}
-
-            <section className="relative min-h-[700px]">
-
-              <div className="absolute left-4 top-4 z-10">
-
-                <input
-                  value={search}
-                  onChange={(event) =>
-                    setSearch(
-                      event.target.value
-                    )
-                  }
-                  placeholder="Search nodes..."
-                  className="w-64 rounded-lg border border-white/10 bg-[#151518]/90 px-3 py-2 text-xs outline-none backdrop-blur focus:border-blue-500"
-                />
-
-              </div>
-
-
-              <div className="absolute bottom-4 left-4 z-10 rounded-lg border border-white/10 bg-[#151518]/90 px-3 py-2 text-xs text-zinc-500 backdrop-blur">
-
-                {filteredGraph.nodes.length}
-                {" "}nodes ·{" "}
-                {filteredGraph.links.length}
-                {" "}edges
-
-              </div>
-
-
-              <ForceGraph2D
-                graphData={filteredGraph}
-
-                nodeId="id"
-
-                nodeLabel={(node: any) => {
-
-                  const n =
-                    node as GraphNode;
-
-                  return `
-                    <div style="
-                      padding: 6px 8px;
-                      background: #18181b;
-                      border: 1px solid #3f3f46;
-                      border-radius: 6px;
-                      color: white;
-                      font-family: sans-serif;
-                      font-size: 12px;
-                    ">
-                      <strong>${escapeHtml(
-                        n.name
-                      )}</strong>
-                      <br/>
-                      <span style="
-                        color: #a1a1aa;
-                      ">
-                        ${escapeHtml(
-                          n.type
-                        )}
-                      </span>
-                      ${
-                        n.file
-                          ? `<br/><span style="color:#71717a">${escapeHtml(n.file)}</span>`
-                          : ""
-                      }
-                    </div>
-                  `;
-                }}
-
-                nodeColor={(node: any) =>
-                  NODE_COLORS[
-                    (node as GraphNode).type
-                  ] || "#ffffff"
-                }
-
-                nodeRelSize={5}
-
-                nodeVal={(node: any) => {
-
-                  const type =
-                    (node as GraphNode).type;
-
-                  if (type === "repository")
-                    return 12;
-
-                  if (type === "directory")
-                    return 8;
-
-                  if (type === "file")
-                    return 6;
-
-                  return 4;
-                }}
-
-                linkColor={(link: any) =>
-                  EDGE_COLORS[
-                    link.type
-                  ] || "#52525b"
-                }
-
-                linkWidth={(link: any) =>
-                  link.type === "depends"
-                    ? 2
-                    : 1
-                }
-
-                linkDirectionalArrowLength={4}
-
-                linkDirectionalArrowRelPos={1}
-
-                linkCurvature={0.12}
-
-                onNodeClick={(node: any) => {
-
-                  setSelectedNode(
-                    node as GraphNode
-                  );
-
-                }}
-
-                onBackgroundClick={() => {
-                  setSelectedNode(null);
-                }}
-
-                nodeCanvasObject={(
-                  node: any,
-                  ctx: CanvasRenderingContext2D,
-                  globalScale: number
-                ) => {
-
-                  const n =
-                    node as GraphNode;
-
-                  const label =
-                    n.name;
-
-                  const fontSize =
-                    Math.max(
-                      9 / globalScale,
-                      2
-                    );
-
-                  const radius =
-                    n.type === "repository"
-                      ? 7
-                      : n.type === "directory"
-                        ? 5
-                        : 4;
-
-                  ctx.beginPath();
-
-                  ctx.arc(
-                    node.x,
-                    node.y,
-                    radius,
-                    0,
-                    2 * Math.PI
-                  );
-
-                  ctx.fillStyle =
-                    NODE_COLORS[
-                      n.type
-                    ] || "#ffffff";
-
-                  ctx.fill();
-
-
-                  if (
-                    globalScale > 1.5
-                  ) {
-
-                    ctx.font =
-                      `${fontSize}px Sans-Serif`;
-
-                    ctx.textAlign =
-                      "center";
-
-                    ctx.textBaseline =
-                      "top";
-
-                    ctx.fillStyle =
-                      "#d4d4d8";
-
-                    ctx.fillText(
-                      label,
-                      node.x,
-                      node.y + radius + 2
-                    );
-                  }
-
-                }}
-
-                cooldownTicks={150}
-
-                d3AlphaDecay={0.03}
-
-                d3VelocityDecay={0.35}
-
-                warmupTicks={50}
-
-                enableNodeDrag={true}
-
-                enableZoomInteraction={true}
-
-                enablePanInteraction={true}
-
-                width={undefined}
-
-                height={700}
-
-              />
-
-            </section>
-
-
-            {/* =================================================
-                Inspector
-            ================================================= */}
-
-            <aside className="border-t border-white/10 p-5 lg:border-l lg:border-t-0">
-
-              <p className="mb-5 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-                Inspector
-              </p>
-
-              {!selectedNode ? (
-
-                <div className="text-sm text-zinc-600">
-                  Click a node to inspect it.
-                </div>
-
-              ) : (
-
-                <NodeInspector
-                  node={selectedNode}
-                  graph={graph}
-                />
-
-              )}
-
-            </aside>
-
-          </div>
-
-        </div>
-
-      )}
-
-
-      {/* =====================================================
-          Empty state
-      ====================================================== */}
-
-      {!graph && !loading && (
-
-        <section className="flex min-h-[600px] items-center justify-center px-6">
-
-          <div className="max-w-lg text-center">
-
-            <div className="mb-5 text-5xl">
-              ◈
-            </div>
-
-            <h2 className="text-2xl font-semibold">
-              Explore a codebase
-            </h2>
-
-            <p className="mt-3 text-sm leading-6 text-zinc-500">
-              Enter a public GitHub repository and
-              CodeAtlas will parse its Python, Java,
-              JavaScript and TypeScript source code
-              into an interactive master graph.
-            </p>
-
-            <div className="mt-6 text-xs text-zinc-700">
-              Functions · Classes · Imports · Calls ·
-              Dependencies · Inheritance
-            </div>
 
           </div>
 
@@ -900,13 +785,385 @@ export default function Home() {
 
       )}
 
+
+      {/* GRAPH */}
+
+      <section className="mx-auto flex max-w-[1800px]">
+
+        {/* LEFT FILTER PANEL */}
+
+        <aside className="hidden w-64 shrink-0 border-r border-zinc-800 p-5 lg:block">
+
+          <h2 className="mb-4 text-sm font-semibold">
+            Filters
+          </h2>
+
+          <input
+            value={search}
+            onChange={(event) =>
+              setSearch(
+                event.target.value
+              )
+            }
+            placeholder="Search nodes..."
+            className="mb-5 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm outline-none"
+          />
+
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+            Nodes
+          </h3>
+
+          <div className="space-y-1">
+
+            {(
+              [
+                "repository",
+                "directory",
+                "file",
+                "class",
+                "interface",
+                "function",
+                "method",
+              ] as NodeType[]
+            ).map((type) => (
+
+              <FilterRow
+                key={type}
+                label={type}
+                active={
+                  visibleNodeTypes.has(
+                    type
+                  )
+                }
+                color={
+                  NODE_COLORS[type]
+                }
+                onClick={() =>
+                  toggleNodeType(type)
+                }
+              />
+
+            ))}
+
+          </div>
+
+          <h3 className="mb-2 mt-7 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+            Edges
+          </h3>
+
+          <div className="space-y-1">
+
+            {(
+              [
+                "contains",
+                "imports",
+                "calls",
+                "inherits",
+                "implements",
+                "instantiates",
+                "depends",
+              ] as EdgeType[]
+            ).map((type) => (
+
+              <FilterRow
+                key={type}
+                label={type}
+                active={
+                  visibleEdgeTypes.has(
+                    type
+                  )
+                }
+                color={
+                  EDGE_COLORS[type]
+                }
+                onClick={() =>
+                  toggleEdgeType(type)
+                }
+              />
+
+            ))}
+
+          </div>
+
+        </aside>
+
+
+        {/* GRAPH CANVAS */}
+
+        <div className="relative h-[calc(100vh-190px)] min-h-[600px] flex-1 overflow-hidden bg-zinc-950">
+
+          {!graph && !loading && (
+
+            <div className="absolute inset-0 flex items-center justify-center">
+
+              <div className="text-center">
+
+                <div className="mb-3 text-4xl">
+                  ◎
+                </div>
+
+                <h2 className="text-lg font-semibold">
+                  No repository analyzed
+                </h2>
+
+                <p className="mt-2 text-sm text-zinc-500">
+                  Enter a GitHub repository above
+                  to build its master graph.
+                </p>
+
+              </div>
+
+            </div>
+
+          )}
+
+          {loading && (
+
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-950/70 backdrop-blur-sm">
+
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900 px-6 py-5 text-center">
+
+                <div className="mb-2 font-medium">
+                  Building master graph
+                </div>
+
+                <div className="text-sm text-zinc-500">
+                  Fetching and parsing repository
+                  source...
+                </div>
+
+              </div>
+
+            </div>
+
+          )}
+
+          {graph && (
+
+            <ForceGraph2D
+              graphData={{
+    nodes: filteredGraph.nodes,
+    links: filteredGraph.edges, // ✅ Maps `edges` to `links` expected by react-force-graph-2d
+  }}
+
+              backgroundColor="#09090b"
+
+              nodeLabel={(node) => {
+                const item =
+                  node as GraphNode;
+
+                return `
+                  <div style="
+                    padding: 6px;
+                    font-family: sans-serif;
+                  ">
+                    <strong>${escapeHtml(
+                      item.name
+                    )}</strong>
+                    <br/>
+                    <span style="opacity:0.7">
+                      ${escapeHtml(
+                        item.type
+                      )}
+                    </span>
+                    ${
+                      item.file
+                        ? `<br/><span style="opacity:0.6">${escapeHtml(
+                            item.file
+                          )}</span>`
+                        : ""
+                    }
+                  </div>
+                `;
+              }}
+
+              nodeColor={(node) =>
+                NODE_COLORS[
+                  (node as GraphNode)
+                    .type
+                ] || "#ffffff"
+              }
+
+              nodeVal={(node) => {
+
+                const item =
+                  node as GraphNode;
+
+                switch (item.type) {
+
+                  case "repository":
+                    return 12;
+
+                  case "directory":
+                    return 7;
+
+                  case "file":
+                    return 5;
+
+                  default:
+                    return 4;
+                }
+
+              }}
+
+              linkColor={(link) =>
+                EDGE_COLORS[
+                  link.type as EdgeType
+                ] || "#52525b"
+              }
+
+              linkDirectionalArrowLength={
+                4
+              }
+
+              linkDirectionalArrowRelPos={
+                1
+              }
+
+              linkWidth={(link) =>
+                link.type === "depends"
+                  ? 2
+                  : 1
+              }
+
+              onNodeClick={(node) =>
+                setSelectedNode(
+                  node as GraphNode
+                )
+              }
+
+              onBackgroundClick={() =>
+                setSelectedNode(null)
+              }
+
+              nodeCanvasObject={(
+                node,
+                ctx,
+                globalScale
+              ) => {
+
+                const item =
+                  node as GraphNode;
+
+                const label =
+                  item.name;
+
+                const fontSize =
+                  Math.max(
+                    8,
+                    12 / globalScale
+                  );
+
+                const radius =
+                  item.type ===
+                  "repository"
+                    ? 7
+                    : 4;
+
+                ctx.beginPath();
+
+                ctx.arc(
+                  node.x ?? 0,
+                  node.y ?? 0,
+                  radius,
+                  0,
+                  2 * Math.PI
+                );
+
+                ctx.fillStyle =
+                  NODE_COLORS[
+                    item.type
+                  ];
+
+                ctx.fill();
+
+                if (
+                  globalScale > 1.5
+                ) {
+
+                  ctx.font =
+                    `${fontSize}px Sans-Serif`;
+
+                  ctx.textAlign =
+                    "center";
+
+                  ctx.textBaseline =
+                    "top";
+
+                  ctx.fillStyle =
+                    "#e4e4e7";
+
+                  ctx.fillText(
+                    label,
+                    node.x ?? 0,
+                    (node.y ?? 0) +
+                      radius +
+                      2
+                  );
+
+                }
+
+              }}
+
+              cooldownTicks={100}
+
+              warmupTicks={100}
+
+              enableNodeDrag
+
+              enableZoomInteraction
+
+              enablePanInteraction
+
+              minZoom={0.2}
+
+              maxZoom={8}
+
+              width={
+                typeof window !==
+                "undefined"
+                  ? window.innerWidth
+                  : undefined
+              }
+
+              height={
+                typeof window !==
+                "undefined"
+                  ? window.innerHeight -
+                    190
+                  : undefined
+              }
+            />
+
+          )}
+
+        </div>
+
+
+        {/* INSPECTOR */}
+
+        {selectedNode && (
+
+          <aside className="hidden w-80 shrink-0 border-l border-zinc-800 bg-zinc-950 p-5 xl:block">
+
+            <NodeInspector
+              node={selectedNode}
+              graph={graph}
+            />
+
+          </aside>
+
+        )}
+
+      </section>
+
     </main>
   );
 }
 
 
 // ============================================================
-// Components
+// STAT
 // ============================================================
 
 function Stat({
@@ -914,33 +1171,37 @@ function Stat({
   value,
 }: {
   label: string;
-  value: number;
+  value: string | number;
 }) {
 
   return (
-    <div className="rounded-lg border border-white/10 bg-[#0c0c0f] px-4 py-3">
+    <div className="bg-zinc-950 px-6 py-4">
 
-      <p className="text-xs text-zinc-600">
+      <div className="text-xs uppercase tracking-wider text-zinc-500">
         {label}
-      </p>
+      </div>
 
-      <p className="mt-1 text-xl font-semibold">
-        {value.toLocaleString()}
-      </p>
+      <div className="mt-1 text-lg font-semibold">
+        {value}
+      </div>
 
     </div>
   );
 }
 
 
+// ============================================================
+// FILTER ROW
+// ============================================================
+
 function FilterRow({
   label,
-  checked,
+  active,
   color,
   onClick,
 }: {
   label: string;
-  checked: boolean;
+  active: boolean;
   color: string;
   onClick: () => void;
 }) {
@@ -948,244 +1209,245 @@ function FilterRow({
   return (
     <button
       onClick={onClick}
-      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition hover:bg-white/5"
+      className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm transition ${
+        active
+          ? "bg-zinc-800 text-zinc-200"
+          : "text-zinc-600"
+      }`}
     >
 
       <span
         className="h-2.5 w-2.5 rounded-full"
         style={{
-          backgroundColor: checked
-            ? color
-            : "#3f3f46",
+          backgroundColor:
+            active
+              ? color
+              : "#3f3f46",
         }}
       />
 
-      <span
-        className={
-          checked
-            ? "text-zinc-300"
-            : "text-zinc-600"
-        }
-      >
-        {label}
-      </span>
+      {label}
 
     </button>
   );
 }
 
 
+// ============================================================
+// NODE INSPECTOR
+// ============================================================
+
 function NodeInspector({
   node,
   graph,
 }: {
   node: GraphNode;
-  graph: GraphData;
+  graph: GraphData | null;
 }) {
 
-  const outgoing =
+  if (!graph) {
+    return null;
+  }
+
+  const connections =
     graph.edges.filter(
       (edge) => {
 
-        const source =
-          typeof edge.source === "string"
+        const sourceId =
+          typeof edge.source ===
+          "string"
             ? edge.source
             : edge.source.id;
 
-        return source === node.id;
-      }
-    );
-
-  const incoming =
-    graph.edges.filter(
-      (edge) => {
-
-        const target =
-          typeof edge.target === "string"
+        const targetId =
+          typeof edge.target ===
+          "string"
             ? edge.target
             : edge.target.id;
 
-        return target === node.id;
+        return (
+          sourceId === node.id ||
+          targetId === node.id
+        );
+
       }
     );
 
   return (
     <div>
 
-      <div
-        className="mb-4 flex h-10 w-10 items-center justify-center rounded-lg"
-        style={{
-          backgroundColor:
-            `${NODE_COLORS[node.type]}22`,
-          color:
-            NODE_COLORS[node.type],
-        }}
-      >
-        ◈
+      <div className="mb-5">
+
+        <div
+          className="mb-2 inline-flex rounded-full px-2 py-1 text-xs"
+          style={{
+            backgroundColor:
+              `${NODE_COLORS[node.type]}22`,
+            color:
+              NODE_COLORS[node.type],
+          }}
+        >
+          {node.type}
+        </div>
+
+        <h2 className="break-words text-lg font-semibold">
+          {node.name}
+        </h2>
+
       </div>
 
 
-      <h2 className="break-words text-lg font-semibold">
-        {node.name}
-      </h2>
+      <div className="space-y-3 text-sm">
 
+        {node.file && (
+          <div>
 
-      <p className="mt-1 text-xs text-zinc-500">
-        {node.type}
-      </p>
+            <div className="text-xs text-zinc-500">
+              File
+            </div>
 
+            <div className="mt-1 break-all text-zinc-300">
+              {node.file}
+            </div>
 
-      {node.file && (
+          </div>
+        )}
 
-        <div className="mt-5">
+        {node.line && (
+          <div>
 
-          <p className="text-[10px] uppercase tracking-wider text-zinc-600">
-            File
-          </p>
+            <div className="text-xs text-zinc-500">
+              Line
+            </div>
 
-          <p className="mt-1 break-all font-mono text-xs text-zinc-400">
-            {node.file}
-          </p>
+            <div className="mt-1 text-zinc-300">
+              {node.line}
+            </div>
 
-        </div>
+          </div>
+        )}
 
-      )}
+        {node.language && (
+          <div>
 
+            <div className="text-xs text-zinc-500">
+              Language
+            </div>
 
-      {node.line && (
+            <div className="mt-1 text-zinc-300">
+              {node.language}
+            </div>
 
-        <div className="mt-4">
-
-          <p className="text-[10px] uppercase tracking-wider text-zinc-600">
-            Line
-          </p>
-
-          <p className="mt-1 text-xs text-zinc-400">
-            {node.line}
-          </p>
-
-        </div>
-
-      )}
-
-
-      {node.language && (
-
-        <div className="mt-4">
-
-          <p className="text-[10px] uppercase tracking-wider text-zinc-600">
-            Language
-          </p>
-
-          <p className="mt-1 text-xs text-zinc-400">
-            {node.language}
-          </p>
-
-        </div>
-
-      )}
-
-
-      <div className="my-5 border-t border-white/10" />
-
-
-      <ConnectionList
-        title="Outgoing"
-        edges={outgoing}
-        graph={graph}
-      />
-
-
-      <ConnectionList
-        title="Incoming"
-        edges={incoming}
-        graph={graph}
-      />
-
-    </div>
-  );
-}
-
-
-function ConnectionList({
-  title,
-  edges,
-  graph,
-}: {
-  title: string;
-  edges: GraphEdge[];
-  graph: GraphData;
-}) {
-
-  if (!edges.length) {
-    return null;
-  }
-
-  return (
-    <div className="mb-5">
-
-      <p className="mb-2 text-[10px] uppercase tracking-wider text-zinc-600">
-        {title}
-      </p>
-
-      <div className="space-y-2">
-
-        {edges.slice(0, 20).map(
-          (edge, index) => {
-
-            const id =
-              typeof edge.target === "string"
-                ? edge.target
-                : edge.target.id;
-
-            const target =
-              graph.nodes.find(
-                (node) =>
-                  node.id === id
-              );
-
-            return (
-              <div
-                key={`${edge.type}-${id}-${index}`}
-                className="rounded-md border border-white/5 bg-white/[0.02] px-2 py-2"
-              >
-
-                <p
-                  className="text-[10px]"
-                  style={{
-                    color:
-                      EDGE_COLORS[
-                        edge.type
-                      ],
-                  }}
-                >
-                  {edge.type}
-                </p>
-
-                <p className="mt-1 break-all text-xs text-zinc-400">
-                  {target?.name || id}
-                </p>
-
-              </div>
-            );
-
-          }
+          </div>
         )}
 
       </div>
 
+
+      <div className="mt-7">
+
+        <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+          Connections ({connections.length})
+        </h3>
+
+        <ConnectionList
+          node={node}
+          graph={graph}
+          edges={connections}
+        />
+
+      </div>
+
     </div>
   );
 }
 
 
 // ============================================================
-// HTML escaping for graph tooltip
+// CONNECTION LIST
+// ============================================================
+
+function ConnectionList({
+  node,
+  graph,
+  edges,
+}: {
+  node: GraphNode;
+  graph: GraphData;
+  edges: GraphEdge[];
+}) {
+
+  return (
+    <div className="space-y-2">
+
+      {edges.slice(0, 50).map(
+        (edge, index) => {
+
+          const sourceId =
+            typeof edge.source ===
+            "string"
+              ? edge.source
+              : edge.source.id;
+
+          const targetId =
+            typeof edge.target ===
+            "string"
+              ? edge.target
+              : edge.target.id;
+
+          const otherId =
+            sourceId === node.id
+              ? targetId
+              : sourceId;
+
+          const otherNode =
+            graph.nodes.find(
+              (item) =>
+                item.id === otherId
+            );
+
+          if (!otherNode) {
+            return null;
+          }
+
+          const outgoing =
+            sourceId === node.id;
+
+          return (
+            <div
+              key={`${edge.type}-${index}`}
+              className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-2"
+            >
+
+              <div className="text-[11px] uppercase tracking-wider text-zinc-500">
+                {outgoing
+                  ? "→"
+                  : "←"}{" "}
+                {edge.type}
+              </div>
+
+              <div className="mt-1 truncate text-sm text-zinc-300">
+                {otherNode.name}
+              </div>
+
+            </div>
+          );
+
+        }
+      )}
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// HTML ESCAPE
 // ============================================================
 
 function escapeHtml(
   value: string
-) {
+): string {
 
   return value
     .replaceAll("&", "&amp;")
